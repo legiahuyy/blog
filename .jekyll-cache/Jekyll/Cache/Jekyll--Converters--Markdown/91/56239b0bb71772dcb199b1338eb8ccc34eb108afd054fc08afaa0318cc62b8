@@ -1,0 +1,10 @@
+I""<h3 id="timezone-of-date">Timezone of date</h3>
+
+<p>In order to accurately record the release date of a post, you should not only setup the <code class="language-plaintext highlighter-rouge">timezone</code> of <code class="language-plaintext highlighter-rouge">_config.yml</code> but also provide the the post’s timezone in field <code class="language-plaintext highlighter-rouge">date</code> of its Front Matter block. Format: <code class="language-plaintext highlighter-rouge">+/-TTTT</code>, e.g. <code class="language-plaintext highlighter-rouge">+0800</code>.</p>
+
+<h3 id="categories-and-tags">Categories and Tags</h3>
+
+<p>The <code class="language-plaintext highlighter-rouge">categories</code> of each post is designed to contain up to two elements, and the number of elements in <code class="language-plaintext highlighter-rouge">tags</code> can be zero to infinity.</p>
+
+<p>The list of posts belonging to the same <em>category</em>/<em>tag</em> is recorded on a separate page. At the same time, the number of these <em>category</em>/<em>tag</em> type pages is equal to the number of <code class="language-plaintext highlighter-rouge">categories</code> / <code class="language-plaintext highlighter-rouge">tags</code> elements for all posts, which means that the two number must be exactly the same.</p>
+:ET
