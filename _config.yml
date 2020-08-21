@@ -17,7 +17,7 @@ description: >-                        # used by seo meta and the atom feed
   alien language
 
 # Replace with the website url, e.g. 'https://username.github.io'
-url: 'https://legiahuyy.github.io'
+url: 'https://legiahuyy.github.io/published/'
 
 author: Gia Huy                  # change to your full name
 
@@ -27,7 +27,7 @@ github:
   username: legiahuyy             # change to your github username
 
 twitter:
-  username: 0x7c00            # change to your twitter username
+  username: "0x7c00"            # change to your twitter username
 
 social:
   name: Le Gia Huy                  # it will shows as the copyright owner in Footer
@@ -47,7 +47,7 @@ google_site_verification: google_meta_tag_verification # change to your verifica
 
 # Only if your site type is GitHub Project sites and doesn't have a custom domain,
 # change below value to '/projectname'.
-baseurl: ''
+baseurl: '/published'
 
 # Change to your timezone › http://www.timezoneconverter.com/cgi-bin/findzone/findzone
 timezone:  Asia/Bangkok
@@ -77,12 +77,16 @@ disqus:
 #
 #     dark   - Use the dark color scheme
 #
-theme_mode: dual
+theme_mode: dark
 
 # boolean type, global switch for ToC in posts.
 toc: true
 
-paginate: 10
+  # Gems
+gems: [jekyll-paginate]
+plugins: [jekyll-paginate]
+
+paginate: 7
 
 markdown: kramdown
 
@@ -117,7 +121,7 @@ defaults:
       breadcrumb:
         -
           label: Posts
-          url: /
+          url: /published/
   -
     scope:
       path: _drafts
@@ -132,7 +136,7 @@ defaults:
       breadcrumb:
         -
           label: Home
-          url: /
+          url: /published/
         -
           label: Tags
           url: /tabs/tags/
@@ -145,7 +149,7 @@ defaults:
       breadcrumb:
         -
           label: Home
-          url: /
+          url: /published/
         -
           label: Categories
           url: /tabs/categories/
@@ -158,7 +162,7 @@ defaults:
       breadcrumb:
         -
           label: Home
-          url: /
+          url: /published/
 
 
 sass:
