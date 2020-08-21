@@ -1,0 +1,483 @@
+I"M�<p>Bài viết này được mình dịch từ blog của team <a href="https://googleprojectzero.blogspot.com/2020/01/remote-iphone-exploitation-part-2.html">Google Project Zero</a>.</p>
+
+<p>Đây là phần thứ hai của series khai thác lỗ hổng CVE-2019–8641 của app iMessage trên iOS 12.4. Nếu bạn chưa hiểu hoặc quên mất chuyện gì đang xảy ra, hãy xem lại <a href="https://medium.com/@ZeroUnix/project-zero-remote-iphone-exploitation-p1-85ed8aeddf51">phần trước</a>.</p>
+
+<p>Lúc trước chúng ta đang nói đến đoạn tìm address space của thiết bị. Bài viết lần này sẽ xoay quanh việc bypass ASLR mà không cần phải có sự tương tác của người dùng hay phải tìm thêm lỗ hổng nào cả.</p>
+
+<p>Đầu tiên ta sẽ bàn về một kỹ thuật khá “xưa cũ”: <strong>heap spraying</strong>. Kỹ thuật này sẽ giúp ta tìm ra được <em>base_address</em> của <a href="http://www.manpagez.com/man/1/dyld/">DYLD_SharedCached_Region</a> (một dynamic linker của iOS) dựa trên lỗi tràn bộ nhớ.</p>
+
+<h1 id="heap-spraying-trên-ios">Heap spraying trên iOS</h1>
+
+<p>Mục đích của việc sử dụng heap spraying là để đưa data vào một vùng địa chỉ biết trước và tham chiếu đến nó khi khai thác. Heap spraying ngày nay cũng không còn hiệu quả nữa (15 năm tuổi rồi) vì sự có mặt của ASLR và đa phần các máy đều sử dụng 64-bit architecture. Tuy nhiên, trên iOS thì kỹ thuật này vẫn có thể xài được bình thường và cũng chỉ cần khoảng 256MB data để có thể chuyển control data vào vùng địa chỉ trên thiết bị. Hãy xem đoạn code sau:</p>
+
+<div class="language-c++ highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><td class="rouge-gutter gl"><pre class="lineno">1
+2
+3
+4
+5
+6
+7
+</pre></td><td class="rouge-code"><pre><span class="k">const</span> <span class="kt">size_t</span> <span class="n">size</span> <span class="o">=</span> <span class="mh">0x4000</span><span class="p">;</span>
+<span class="k">const</span> <span class="kt">size_t</span> <span class="n">count</span> <span class="o">=</span> <span class="p">(</span><span class="mi">256</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span><span class="p">)</span> <span class="o">/</span> <span class="n">size</span><span class="p">;</span>
+<span class="k">for</span> <span class="p">(</span><span class="kt">int</span> <span class="n">i</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="n">count</span><span class="p">;</span> <span class="n">i</span><span class="o">++</span><span class="p">)</span> <span class="p">{</span>
+     <span class="kt">int</span><span class="o">*</span> <span class="n">chunk</span> <span class="o">=</span> <span class="n">malloc</span><span class="p">(</span><span class="n">size</span><span class="p">);</span>
+     <span class="o">*</span><span class="n">chunk</span> <span class="o">=</span> <span class="mh">0x41414141</span><span class="p">;</span>
+<span class="p">}</span>
+   <span class="c1">// Giờ hãy để ý vùng địa chỉ 0x110000000 trong bộ nhớ</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Sau khi thực thi thì đoạn code sẽ set giá trị tại <code class="language-plaintext highlighter-rouge">0x110000000</code> thành ` 0x41414141`:</p>
+
+<pre><code class="language-pseudocode">(lldb) x/gx 0x110000000
+0x110000000: 0x0000000041414141
+</code></pre>
+
+<h2 id="heap-spraying-imessage">Heap spraying iMessage</h2>
+
+<p>Điều tiếp theo chúng ta làm là tìm hiểu cách tốt nhất để “spray” vài trăm MB data qua iMessage. Nói đơn giản thì có hai cách để làm điều đó như sau:</p>
+
+<ol>
+  <li>Bằng cách lợi dụng bug memory leak — một bug mà chunk data bị “lãng quên” và không bao giờ được giải phóng, từ đó ta có thể khiến nó nhân lên vài lần cho đến khi tràn bộ nhớ.</li>
+  <li>Hoặc khai thác “amplification gadget”: một đoạn code nhỏ dùng để lấy chunk data có sẵn ra rồi copy =&gt; ta chỉ cần gửi một vài byte rồi để nó tự <em>khuếch đại</em> liên tục như thế để đạt được lượng byte mà ta muốn.</li>
+</ol>
+
+<p>May mắn là NSKeyedUnarchiver API cũng “tài trợ” luôn cho chúng ta trong exploit lần này: Nó gửi được tin nhắn tầm 100kB là maximun rồi, vì vậy khi mình spray khoảng 32MB heap data nó sẽ leak ra 32MB và ta sẽ lặp lại điều đó một vài lần cho đến khi được full heap spray.</p>
+
+<p>Nhưng mà ta có thể gửi toàn bộ số byte cần spray chỉ với một tin nhắn bằng cách sử dụng tính năng <strong>download attachments</strong> (pbdi key). Bằng cách này, memory leak là điều không cần thiết nữa và bug có thể được trigger vài lần nếu cần thiết. Mình sẽ dành phần này cho bạn đọc như một exercise nhé.</p>
+
+<p>Có rất nhiều chỗ trong subsystem của NSKeyedUnarchive bị leak memory. Ví dụ như phần <em>cyclic object graph</em> trong phần một, khi mà chunk data không bao giờ được giải phóng mà cứ liên tục tham chiếu lẫn nhau. Hay một subclass khác là <em>__NSKeyedCoderOldStyleArray</em> (dùng để decode <a href="https://developer.apple.com/documentation/foundation/nsvalue">NSValues</a>) lại luôn deserialize mọi class bất kể có được phép hay không. __NSKeyedCoderOldStyleArray sẽ lưu size và con trỏ của nó vào một chunk đã được khởi tạo dưới dạng cùng kiểu dữ liệu (integer, CString hoặc ObjC object).</p>
+
+<p>Thú vị là khi __NSKeyedCoderOldStyleArray bị giải phóng, nó chỉ free đúng phần backing memory và không free object bên trong. Do đó, mảng chứa các con trỏ sẽ trỏ đến một vùng nhớ khác dẫn đến memory leak. Điều này đáng ra không quá tệ vì __NSKeyedCoderOldStyleArray chỉ được dùng để decode “tạm thời” một mảng của NSValue nhưng vì __NSKeyedCoderOldStyleArray cũng có thể <em>được decode</em> dưới dạng một standalone object khiến nó leak những ObjC object bên trong.</p>
+
+<p>Ngoài ra phần <em>amplification gadget</em> cũng có một instance ACZeroingString cũng đóng vai trò quan trọng trong exploit vì nó là một phần của <em>initWithCoder</em>, ACZeroingString sẽ lấy một NSData object rồi copy nội dung vào một vùng nhớ mới.</p>
+
+<p>Sau đây là graph của việc spray 32MB heap data:</p>
+
+<p><img src="https://miro.medium.com/max/800/0*n1CVMeFdgXWIO6lh.png" alt="Image for post" /></p>
+
+<p>Ta có thể thấy ở mỗi instance ACZeroingString nó sẽ copy nội dung của NSData vào một buffer và __NSKeyedCoderOldStyleArrray sẽ giữ toàn bộ instance đó được liên tục update kể cả khi tin nhắn đã được gửi đi. Sau khi gửi 8 tin nhắn như thế này, control data sẽ có địa chỉ tại <em>0x110000000</em>.</p>
+
+<p>Việc chuyển control data vào địa chỉ trên chỉ là bước đầu tiên mà thôi. Tiếp theo chúng ta sẽ phải tạo các <em>đối tượng ObjC giả</em> trong vùng heapspray và để hệ thống xử lí chúng trong key index của NSSharedKeySet. Tuy nhiên, vì nội dung bên trong heapspray không thể chạy được, ta cần phải biết địa chỉ của code page trước khi làm giả object.</p>
+
+<h1 id="bypass-aslr-bằng-objective-c">Bypass ASLR bằng Objective-C</h1>
+
+<p>Dưới đây là một snippet của <strong>[NSSharedKeySet indexForKey:]</strong></p>
+
+<pre><code class="language-pseudocode">// index is fully controlled, _keys is nullptr
+      id candidate = self-&gt;_keys[index];
+      if (candidate != null) {
+        if ([key isEqual:candidate]) {
+          return prevLength + index;
+        }
+      }
+</code></pre>
+
+<p>Kiểu dữ liệu ‘id’ được sử dụng ở đây là đại diện cho việc tham chiếu đến ObjC object, na ná <code class="language-plaintext highlighter-rouge">void*</code> trong C. Nhưng điều khác biệt là Object-C có RTTI (<strong>R</strong>un-<strong>t</strong>ime <strong>T</strong>ype <strong>I</strong>nformation) nên nó sẽ luôn biết được kiểu dữ liệu của một object trong runtime, ví dụ như <a href="https://developer.apple.com/documentation/objectivec/1418956-nsobject/1418511-iskindofclass?language=objc"><em>isKindOfClass</em></a> method. Hơn nữa, ObjC hỗ trợ pointer tagging (con trỏ địa chỉ), và object pointer (con trỏ đối tượng). Vì thế, ‘id’ có thể là một trong hai thứ sau:</p>
+
+<ol>
+  <li>Là một object pointer</li>
+  <li>Là một pointer-sized value chứa cả kiểu dữ liệu lẫn thông tin.</li>
+</ol>
+
+<p>Phần layout của những object này rất quan trọng vì nó chính là ‘chìa khóa’ để ta có được RCE nhưng trong bài viết này ta sẽ khoan nhắc đến nó mà chỉ dừng ở phần tagged pointer trước đã.</p>
+
+<p><a href="https://developer.apple.com/documentation/foundation/nsnumber?language=objc">NSNumbers</a> và <a href="https://developer.apple.com/documentation/foundation/nsstring">NSStrings</a> là hai ví dụ cho tagged pointer. Trên bộ xử lí Arm64, một ‘id’ được xem như là một tagged pointer nếu <a href="https://github.com/opensource-apple/objc4/blob/cd5e62a5597ea7a31dccef089317abb3a661c154/runtime/objc-config.h#L79">flag MSB</a> của nó được set. Trong trường hợp đó, class tương ứng sẽ được <a href="https://github.com/opensource-apple/objc4/blob/cd5e62a5597ea7a31dccef089317abb3a661c154/runtime/objc-object.h#L656">lưu trong một global table</a> và index của table đó sẽ được encode vào tagged pointer. Thế nên một instance NSNumber chứa một 32-bit integer (trong ObjC: <code class="language-plaintext highlighter-rouge">NSNumber* n = @42</code>) sẽ được biểu diễn như sau:</p>
+
+<div class="language-plaintext highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><td class="rouge-gutter gl"><pre class="lineno">1
+2
+</pre></td><td class="rouge-code"><pre>0xb0000000000002a2
+(1 011 00…001010100010)
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Khi đó MSB flag sẽ có giá trị (1), ra hiệu rằng một tagged pointer và 3 bit tiếp theo của nó là index của class. Nếu MSB flag là (3), tương ứng với __NSCFNumber, giá trị 32-bit của con trỏ sẽ nằm trong bit 8-&gt;40 trong khi các byte dưới cùng chỉ ra kiểu dữ liệu, trong trường hợp này là <a href="https://developer.apple.com/documentation/corefoundation/cfnumbertype/kcfnumbersint32type?language=objc">kCFNumberSInt32Type</a>.</p>
+
+<p>Các API thường sẽ kiểm tra tag bit của các ‘id’ ObjC (objc_msgSend, objc_retain, objc_xyz):</p>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><td class="rouge-gutter gl"><pre class="lineno">1
+2
+3
+4
+5
+</pre></td><td class="rouge-code"><pre><span class="k">if</span> <span class="p">(</span><span class="n">arg</span> <span class="o">&amp;</span> <span class="mh">0x8000000000000000</span><span class="p">)</span> <span class="p">{</span>
+ <span class="c1">// handle tagged pointer</span>
+ <span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+ <span class="c1">// handle real pointer</span>
+ <span class="p">}</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Phương thức kiểm tra này là để chống các <a href="http://www.phrack.org/issues/69/9.html">kỹ thuật khai thác tagged pointer</a>, giá trị của các tagged pointer sẽ được XOR với một giá trị bất kì cho mỗi process:</p>
+
+<pre><code class="language-pseudocode">0xb0000000000002a2 ^ objc_debug_taggedpointer_obfuscator
+</code></pre>
+
+<p><code class="language-plaintext highlighter-rouge">objc_debug_taggedpointer_obfuscator</code> có lẽ là một con số hoàn toàn ngẫu nhiên chỉ trừ MSB thì nó có giá trị là ‘0’ (bit dành riêng cho tagged pointer). Sử dụng lldb và một app iOS đơn giản ta có được như sau:</p>
+
+<pre><code class="language-objective-c">(lldb) p n
+(__NSCFNumber *) $0 = 0xf460034a00975a82 (int)42
+(lldb) p objc_debug_taggedpointer_obfuscator
+(void *) $1 = 0x4460034a00975820
+(lldb) p/x (uintptr_t)n ^ (uintptr_t)objc_debug_taggedpointer_obfuscator
+(unsigned long) $9 = 0xb0000000000002a2
+</code></pre>
+
+<h2 id="dyld-shared-cache">Dyld Shared Cache</h2>
+
+<p>Trên iOS (hoặc macOS), hầu hết các thư viện hệ thống đều được prelink vào một binary blob rất lớn được gọi là <a href="https://iphonedevwiki.net/index.php/Dyld_shared_cache">dyld_shared_cache</a>. Điều này giúp cải thiện load-time rất đáng kể.</p>
+
+<p>Mặt khác, shared cache được hệ thống map lại với cùng một địa chỉ cho mọi process và chỉ được random một lần duy nhất là khi thiết bị boot. Nguyên nhân có thể là do shared cache bị map vào toàn bộ process của user (làm giảm hiệu suất chung của bộ nhớ hệ thống) đồng thời nó cũng chứa một con trỏ của chính nó nữa khiến cho share cache có thể <a href="https://en.wikipedia.org/wiki/Position-independent_code">được copy từ bất kì khu vực bộ nhớ nào</a>. Nên ta sẽ biết được base_address dựa vào địa chỉ của shared cache, base_address sẽ chứa địa chỉ của hầu hết các thư viện mà các process của user đang sử dụng, bao gồm: các tiện ích ROP (gadget), mọi ObjC class, chuỗi và nhiều thứ khác. Quá đủ để thực hiện khai thác RCE.</p>
+
+<p>Ở những phiên bản mới nhất của iOS, dyld_shared_cache sẽ được map lại đâu đó trong vùng từ 0x180000000 đén 0x280000000, bao gồm hơn 200000 base_address cũng như cache của nó cũng phải xấp xỉ 1GB và page size của nó khoẳng 0x4000 byte. Ta có thể tìm những base_address theo ý mình bằng bruteforce, nhưng mỗi lần sai có thể process sẽ bị crash và sẽ bị giới hạn bởi service <em>launchd</em> nếu bruteforce của ta làm máy crash quá nhiều lần. Điều này có thể được tránh bằng cách chỉ crash mỗi 10s =&gt; tốn đến 3–4 tuần để bruteforce — exploit kiểu này không khả thi lắm. Nhưng phần tiếp theo sẽ chỉ ra cách tìm base_address chỉ trong vòng chưa đến năm phút.</p>
+
+<h2 id="bypass-aslr-với-oracle-crash">Bypass ASLR với Oracle Crash</h2>
+
+<p>Một thứ rất đặc biệt của lỗ hổng CVE-2019–8646 là nó có thể tạo ra một communication channel giữa victim và attacker. Đây cũng là một tình huống nghiêm trọng mà các nhà phát hành nên lưu ý khi để các tiến trình tự do thực hiện các network request ngoài sandbox. Và để có được RCE nhắc đến ở phần một, ta phải tìm communication channel của iMessage.</p>
+
+<p>iMessage cũng hỗ trợ các tính năng như “read” (đã xem), “delivered” (đã gửi) tương tự như seen hay sent của app Messenger của Facebook.</p>
+
+<p><img src="https://miro.medium.com/max/698/0*moeYbETbI9FYeskT.png" alt="Image for post" style="zoom:67%;" /></p>
+
+<p>Người gửi nhận được tín hiệu ‘đã xem’ của người nhận ở tin nhắn “Foo” và tín hiệu ‘đã gửi’ ở tin nhắn “Bar” còn “Baz” thì không có gì cả. Các <em>tín hiệu</em> đó được gửi đi và nhận lại một cách tự động và không cần sự tương tác của ngời dùng, đặc biệt nó còn được gửi bởi tiến trình <strong>imagent</strong>.</p>
+
+<p>Pseudocode cách imagent xử lí tin nhắn:</p>
+
+<pre><code class="language-pseudocode">processIncomingMessage(message):
+msgPlist = decodeIntoPlist(message)
+# extract some values from the plist …
+atiData = msgPlist['ATI']
+ati = NSKeyedUnarchive(atiData) [1]
+# more stuff …
+sendDeliveryReceipt()
+# yet more stuff …
+</code></pre>
+
+<p>Bất kì bug nào trong NSKeyedUnarchiver API cũng sẽ được <em>kích hoạt</em> tại [1] nên ta có thể build một “oracle crash” nếu ta có thể crash khi API NSKeyedUnarchiver đang làm việc thì sẽ không có thông báo ‘delivery’ nào được gửi đi mà thay vào đó là một payload chúng ta muốn. Điều này cho phép <em>người gửi</em> có thể tùy ý crash tiến trình imagent của thiết bị nhận. Lợi dụng điều này, ta có thể chuyển từ một bug thành một “feature” có lợi cho việc tấn công rồi.</p>
+
+<p>Ta có thể hiểu đơn giản các truy vấn oracle diễn ra như sau:</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><td class="rouge-gutter gl"><pre class="lineno">1
+2
+3
+4
+5
+</pre></td><td class="rouge-code"><pre><span class="k">def</span> <span class="nf">oracle</span><span class="p">(</span><span class="n">addr</span><span class="p">):</span>
+     <span class="k">if</span> <span class="n">isMapped</span><span class="p">(</span><span class="n">addr</span><span class="p">):</span>
+       <span class="n">nocrash</span><span class="p">()</span>
+     <span class="k">else</span>
+       <span class="n">crash</span><span class="p">()</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Nhờ đó, việc bypass ASLR từ xa trở nên đơn giản hơn:</p>
+
+<ol>
+  <li>Thực hiện <a href="https://vietjack.com/cau-truc-du-lieu-va-giai-thuat/giai-thuat-tim-kiem-tuyen-tinh.jsp"><em>tìm kiếm tuyến tính</em></a> <em>(linear search)</em> giữa hai vùng 0x18000000 và 0x28000000, mỗi bước nhảy ~500MB, việc tìm kiếm này sẽ chiếm nhiều nhất 8 lần truy vấn oracle.</li>
+  <li>Thực hiện <a href="https://vietjack.com/cau-truc-du-lieu-va-giai-thuat/giai-thuat-tim-kiem-nhi-phan.jsp"><em>tìm kiếm nhị phân</em></a> <em>(binary search)</em> giữa các địa chỉ tìm được ở bước một. Bước tìm kiếm này cũng chỉ chiếm một vài truy vấn thôi vì nó chạy trong thời gian logarithm.</li>
+</ol>
+
+<p>Để bypass ASLR thì ít nhất 10 và không nhiều hơn 20 tin nhắn iMessage được gửi đi.</p>
+
+<p>Tuy nhiên trong thực tế thì lỗ hổng bộ nhớ sẽ không giúp chúng ta thực hiện truy vấn một cách dễ dàng như thế này. Vì vậy ta cần phải có một phiên bản tổng quát hơn của thuật toán trên. Dù sao thì trong mọi trường hợp, để khai thác được lỗ hổng trước hết phải đáp ứng được một số kĩ thuật khai thác nhất định. Đây cũng là yêu cầu dành cho CVE-2018–8641.</p>
+
+<p>Đầu tiên, bug trigger đã nhắc đến ở phần một của series này luôn làm crash hệ thống mặc dù có địa chỉ hợp lệ.</p>
+
+<pre><code class="language-objective-c">-[NSSharedKeyDictionary initWithCoder:coder] {
+  self-&gt;_keyMap = [coder decodeObjectOfClass:[NSSharedKeySet class]
+                         forKey:"NS.skkeyset"];
+  // ... decode values etc.
+}
+
+-[NSSharedKeySet initWithCoder:coder] {
+  self-&gt;_numKey = [coder decodeInt64ForKey:@"NS.numKey"];
+  self-&gt;_rankTable = [coder decodeBytesForKey:@"NS.rankTable"];
+  // ... copy more fields from the archive
+  self-&gt;_subSharedKeySet = [coder 
+                            decodeObjectOfClass:[NSSharedKeySet class]
+                            forKey:@"NS.subskset"]];
+
+  NSArray* keys = [coder decodeObjectOfClasses:[...] 
+                         forKey:@"NS.keys"]];
+  if (self-&gt;_numKey != [keys count]) {
+    return fail(“Inconsistent archive);
+  }
+  self-&gt;_keys = calloc(self-&gt;_numKey, 8);
+  // copy keys into _keys
+
+  // Verify that all keys can be looked up
+  for (id key in keys) {
+    if ([self indexForKey:key] == -1) {
+      NSMutableArray* allKeys = [NSMutableArray arrayWithArray:keys];
+      [allKeys addObjectsFromArray:[self-&gt;_subSharedKeySet allKeys]];
+      return [NSSharedKeySet keySetWithKeys:allKeys];
+    }
+  }
+}
+</code></pre>
+
+<p>ObjC id được đọc từ một địa chỉ do người tấn công kiểm soát sau đó id này sẽ được so sánh với key đang được tìm kiếm (dòng 13 của phần <code class="language-plaintext highlighter-rouge">[NSSharedKeySet indexForKey:]</code>). Nếu như nó không tương đồng, việc lookup sẽ fail và <code class="language-plaintext highlighter-rouge">[NSSharedKeySet initWithCoder:]</code> sẽ cố tạo lại NSSharedKeySet từ đầu. Vì thế nên nó sẽ gọi <code class="language-plaintext highlighter-rouge">[NSSharedKeySet allKeys]</code> trong <code class="language-plaintext highlighter-rouge">subKeySet</code> của nó. Không may rằng, vì <code class="language-plaintext highlighter-rouge">subKeySet</code> chưa hoàn toàn được khởi tạo (bug có nhắc đến ở phần 1), phương thức <code class="language-plaintext highlighter-rouge">allKeys</code> sẽ crash ngay lập tức khi nó truy cập vào mảng <code class="language-plaintext highlighter-rouge">_keys</code> khi nó vẫn là nullptr (mảng rỗng, chưa được khởi tạo). Mặc dù vậy, ta vẫn có thể làm việc với chúng:</p>
+
+<p><img src="https://miro.medium.com/max/800/0*H5cwg78sSnpd3CGB.png" alt="Image for post" style="zoom:80%;" /></p>
+
+<p>Trick ở đây là ta thêm vào cuối mảng một KeySet mới (SharedKeySet3), keyset này sẽ luôn có thể look up key thứ hai (“k2”). Tuy nhiên, do KeySet này đã trở thành subKeySet mới của <code class="language-plaintext highlighter-rouge">SharedKeySet1</code>, nên <code class="language-plaintext highlighter-rouge">SharedKeySet2</code> bắt buộc phải được unarchive (giải nén) bằng cách khác. Vấn đề này chỉ khả thi khi ta unarchive <code class="language-plaintext highlighter-rouge">SharedKeyDictionary</code> trước bằng cách thông qua mảng <code class="language-plaintext highlighter-rouge">_keys</code> của <code class="language-plaintext highlighter-rouge">SharedKeySet1</code>. Xui là whitelist của class này khi được dùng để unarchive <code class="language-plaintext highlighter-rouge">_keys</code> không hề xài đến NSDictionary. Dù vậy, class <code class="language-plaintext highlighter-rouge">__NSLocalizedString</code> (bản thân nó giống NSString) có một đoạn code giúp ta decode config dictionary của nó:</p>
+
+<div class="language-plaintext highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><td class="rouge-gutter gl"><pre class="lineno">1
+2
+3
+</pre></td><td class="rouge-code"><pre>NSSet* classes = [NSSet setWithObjects:[NSDictionary class], ...];
+NSDictionary* configDict = [coder decodeObjectOfClasses:classes 
+                                  forKey:@"NS.configDict"]
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Vì NSSharedKeyDictionary có thể được decode trong khi mảng <code class="language-plaintext highlighter-rouge">_keys</code> đang được giải nén bằng cách “gói gọn” bản thân nó vào __NSLocalizedString.</p>
+
+<p>Bằng cách này, việc unarchive payload chỉ crash khi đáp ứng một trong hai yếu tố:</p>
+
+<ol>
+  <li>Nếu địa chỉ (trong trường hợp này <code class="language-plaintext highlighter-rouge">0x41414140</code> được xem như index của <code class="language-plaintext highlighter-rouge">_rankTable</code> được nhân lên 8) không đọc được (hay chưa được map lại).</li>
+  <li>Nếu việc gọi <code class="language-plaintext highlighter-rouge">[key isEqual:candidate]</code> với giá trị được được từ địa chỉ bị crash.</li>
+</ol>
+
+<p>Nếu có giá trị là 0, <code class="language-plaintext highlighter-rouge">[key isEqual:]</code> sẽ không được gọi. Ngược lại, nếu giá trị không được set MSB, nó sẽ được xem như một con trỏ đến ObjC object và các phương thức sẽ được gọi dựa theo nó, chắc chắn việc này sẽ dẫn đến crash <em>trừ khi giá trị con trỏ là một ObjC object</em>. Cuối cùng, nếu giá trị đã được set MSB, nó sẽ dược xem như một con trỏ vùng nhớ (tagged pointer) và class của nó sẽ hợp lệ. Điều này xảy ra bằng cách XOR con trỏ vùng nhớ với <em>một giá trị random được mã hóa</em>, sau đó truyền index vào class table từ các bit cao hơn và sử dụng nó. Do giá trị XOR chung với tagged pointer bị mã hóa, ta không thể biết rằng giá trị nào khi truyền vào con trỏ sẽ làm crash. Tuy nhiên có một giải pháp khiến ta dù có truyền một địa chỉ sai vào tagged pointer thì cũng sẽ không gây crash: Chính là nhờ phương thức <code class="language-plaintext highlighter-rouge">[NSCFString isEqual:]</code>, nó được sử dụng khi key đang tham chiếu là một chuỗi:</p>
+
+<div class="language-plaintext highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><td class="rouge-gutter gl"><pre class="lineno">1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+</pre></td><td class="rouge-code"><pre>if (a3 &amp; 0x8000000000000000) {
+  // Extract class index from tagged pointer
+  v5 = ((a3 ^ objc_debug_taggedpointer_obfuscator) &gt;&gt; 60) &amp; 7;
+  if ( v5 == 7 )
+    // Use extended class index in bits 52 - 60
+    v5 = (((a3 ^ objc_debug_taggedpointer_obfuscator) &gt;&gt; 52) &amp; 0xFF) + 8;// Check class index equals the one for NSString
+  if ( v5 == 2 )
+    // If yes, extract string content from lower bits and compare
+    return _NSTaggedPointerStringEqualCFString(a3, self);// If not, just return false directly
+  return 0;
+}
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Phương thức này khiến cho mọi giá trị có cờ MSB set được sử dụng như tham biến mà không tạo ra crash.</p>
+
+<p>Kết hợp những thứ trên, oracle function đã trở nên khái quát hơn:</p>
+
+<div class="language-plaintext highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><td class="rouge-gutter gl"><pre class="lineno">1
+2
+3
+4
+5
+6
+</pre></td><td class="rouge-code"><pre>oracle(addr):
+  if isMapped(addr) and 
+     (isZero(*addr) or hasMSBSet(*addr) or pointsToObjCObject(*addr)):
+    nocrash()
+  else:
+    crash()
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Để sử dụng hàm oracle này, ta cần phải build một “profile” trên vùng shared cache trên máy nạn nhân (một vùng bitmap), giá trị ‘0’ có nghĩa việc truy cập sẽ crash và ‘1’ thì không. Vì vùng shared cache giống nhau hoàn toàn trên các thiết bị iPhone có hardware model giống nhau và cùng phiên bản iOS, việc này có thể được thực hiện bằng cách chạy một custom app trên một thiết bị tương đồng và scan toàn bộ vùng shared cache trong bộ nhớ. Trên thực tế, profile cũng nên hỗ trợ một trạng thái “dự phòng” để khi gặp hai trường hợp 0/1 trên bitmap. Nhưng để đơn giản hóa vấn đề, giải thích sau sẽ giả định profile chỉ bao gồm hai trạng thái chính.</p>
+
+<p>Bitmap cho một profile gồm hai trạng thái như sau:</p>
+
+<p><img src="https://miro.medium.com/max/800/0*nQYTEoKDkRjcSqTP.png" alt="Image for post" /></p>
+
+<p>Bước kế tiếp là sử dụng hàm <code class="language-plaintext highlighter-rouge">oracle</code> dể tìm kiếm tuyến tính giữa vùng 0x18000000 và 0x28000000 cho đến khi không có crash nào xảy ra. Sau đó, tính toán các địa chỉ trong shared cache bằng cách lặp profile với pagesized step (page memory là vùng nhớ ảo). Trong thực tế, bước này sẽ cho kế quả từ 30000~40000 các <code class="language-plaintext highlighter-rouge">base_address</code> khác nhau (candidate).</p>
+
+<p>Tiếp theo, một thuật toán tìm kiếm sẽ được sử dụng để nâng cao hiệu suất tìm ra địa chỉ chính xác mà chỉ sử dụng một lượng ít truy vấn oracle (mỗi truy vấn oracle sẽ mất khoảng 10s để tránh việc imagent bị crash quá nhanh). Ảnh sau sẽ biểu diễn shared cache map lẫn nhau bằng các <code class="language-plaintext highlighter-rouge">base_address</code></p>
+
+<p><img src="https://miro.medium.com/max/1600/0*P25quU1fYgWdCN3u.png" alt="Image for post" /></p>
+
+<p>Mục đích hiện tại của chúng ta là tìm một địa chỉ mới bằng cái gửi truy vấn oracle. Địa chỉ mới này sẽ cho phép loại đi ít nhất nửa số <code class="language-plaintext highlighter-rouge">base_address</code> không hợp lệ mà ta đã tìm được (còn ~15000 đến 20000). Giờ hãy chú ý vào địa chỉ <code class="language-plaintext highlighter-rouge">0x19020c028</code> (màu xanh lá), nếu crash xuất hiện khi ta đang truy vấn oracle cho địa chỉ đó thì chỉ có <code class="language-plaintext highlighter-rouge">base_address</code> đầu tiên và cuối cùng được giữ lại, còn nếu nó không crash thì có ba <code class="language-plaintext highlighter-rouge">base_address</code> ở giữa sẽ được giữ lại.</p>
+
+<p><em>(Xem hình giải thích ở dưới để hiểu tại sao khi crash địa chỉ màu xanh lại loại được ba</em> <code class="language-plaintext highlighter-rouge">base_address</code> <em>ở giữa và ngược lại)</em></p>
+
+<p><img src="https://miro.medium.com/max/1600/1*vg3qIupTwHb7VooRR_0e6g.png" alt=" Hai ô mình khoanh tròn là các chunk data mà 0x19020c028 tham chiếu đến" /></p>
+
+<p>Từ đó ta sẽ có được các <code class="language-plaintext highlighter-rouge">base_address</code> cần tìm, đồng thời việc này cũng đã cho biết tỉ lệ của việc crash (trong trường hợp này là 2/5). Ta suy ra được số lượng <code class="language-plaintext highlighter-rouge">base_address</code> còn lại (E) sau khi truy vấn oracle:
+\(E = 3/5 * 3 + 2/5 * 2 = 2.6\)
+Sau khi lặp liên tục, thuật toán sẽ chọn ra địa chỉ với giá trị (E) nhỏ nhất. Lý tưởng là khi các số 1 và 0 trong profile gần như cân bằng (thực tế thì có thể nhiều hoặc ít hơn) thì <code class="language-plaintext highlighter-rouge">base_address</code> với số (E) ít nhất sẽ được tìm ra trong vòng 2–5 phút.</p>
+
+<p>Khi ứng dụng thuật toán này, ta sẽ gặp phải một vấn đề nhỏ về hiệu suất vì khi thực hiện full search cho các <code class="language-plaintext highlighter-rouge">base_address</code>, số operation phải chạy được tính theo công thức: <code class="language-plaintext highlighter-rouge">shared_cache_size / 8 * num_candidates</code>. Việc này có thể khiến số operation lên đến nghìn tỉ (10¹²). Mặc dù vậy, trong thực tế thì chúng ta không test tuần tự từng địa chỉ mà chỉ cần test ngẫu nhiên 100 địa chỉ khác nhau mà thôi.</p>
+
+<p>Một vấn đề khác xuất hiện khi ta sử dụng “profile-ba-trạng-thái” được nhắc đến ở trên thì thuật toán sẽ ngầm định các writable-memory-page (một vùng nhớ) vừa có thể crash vừa có thể không (50/50) vì ta không biết được giá trị nào sẽ nằm trong vùng nhớ đó vào thời điểm runtime. Tuy nhiên, một lần nữa, thì khả năng crash trong thực tế lại hoạt động bình thường vì vấn đề nhỏ này không ảnh hưởng đến độ chính xác của thuật toán trên.</p>
+
+<p>Sau đây là pseudocode phiên bản hoàn thiện của thuật toán trên:</p>
+
+<pre><code class="language-pseudocode">candidates = [...]
+while len(candidates) &gt; 1:
+  best_address = 0x0
+  best_E = len(candidates)
+  remaining_candidates_on_crash = None
+  remaining_candidates_on_nocrash = Nonefor _ in range(0, 100):
+    addr = random.randrange(minbase, maxbase, 8)
+    crashset = []
+    nocrashset = []
+    for profile in candidates:
+      if profile.addr_will_crash(addr):
+        crashset.append(profile)
+      if profile.addr_will_not_crash(addr):
+        nocrashset.append(profile)crash_prob = len(crashset) / len(candidates)
+    nocrash_prob = 1.0 - crash_prob 
+    E = crash_prob * len(crashset) + nocrash_prob * len(nocrashset)
+    if E &lt; best_E:
+      best_E = E
+      best_address = addr
+      remaining_candidates_on_crash = crashset
+      remaining_candidates_on_nocrash = nocrashsetif oracle(best_address):
+    candidates = remaining_candidates_on_nocrash
+  else:
+    candidates = remaining_candidates_on_crash
+</code></pre>
+
+<p>Output của exploit:</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><td class="rouge-gutter gl"><pre class="lineno">1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+</pre></td><td class="rouge-code"><pre><span class="o">&gt;</span> <span class="p">.</span><span class="o">/</span><span class="n">aslrbreaker</span><span class="p">.</span><span class="n">py</span>
+<span class="p">[</span><span class="err">!</span><span class="p">]</span> <span class="n">Note</span><span class="p">:</span> <span class="n">this</span> <span class="n">exploit</span> <span class="o">*</span><span class="n">deliberately</span><span class="o">*</span> <span class="n">displays</span> <span class="n">notifications</span> <span class="n">to</span> <span class="n">the</span> <span class="n">target</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Trying</span> <span class="n">to</span> <span class="n">find</span> <span class="n">a</span> <span class="n">valid</span> <span class="n">address</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Testing</span> <span class="n">address</span> <span class="mh">0x180000000</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Testing</span> <span class="n">address</span> <span class="mh">0x188000000</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Testing</span> <span class="n">address</span> <span class="mh">0x190000000</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Testing</span> <span class="n">address</span> <span class="mh">0x198000000</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Testing</span> <span class="n">address</span> <span class="mh">0x1a0000000</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Testing</span> <span class="n">address</span> <span class="mh">0x1a8000000</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Testing</span> <span class="n">address</span> <span class="mh">0x1b0000000</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Testing</span> <span class="n">address</span> <span class="mh">0x1b8000000</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Testing</span> <span class="n">address</span> <span class="mh">0x1c0000000</span><span class="p">...</span>
+<span class="p">[</span><span class="o">+</span><span class="p">]</span> <span class="mh">0x1c0000000</span> <span class="ow">is</span> <span class="n">valid</span><span class="err">!</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Have</span> <span class="mi">34353</span> <span class="n">potential</span> <span class="n">candidates</span> <span class="k">for</span> <span class="n">the</span> <span class="n">dyld_shared_cache</span> <span class="n">slide</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Shared</span> <span class="n">cache</span> <span class="ow">is</span> <span class="n">mapped</span> <span class="n">somewhere</span> <span class="n">between</span> <span class="mh">0x181948000</span> <span class="ow">and</span> <span class="mh">0x203d64000</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Now</span> <span class="n">determining</span> <span class="n">exact</span> <span class="n">base</span> <span class="n">address</span> <span class="n">of</span> <span class="n">shared</span> <span class="n">cache</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="mi">34353</span> <span class="n">candidates</span> <span class="n">remaining</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Best</span> <span class="p">(</span><span class="n">approximated</span><span class="p">)</span> <span class="n">address</span> <span class="n">to</span> <span class="n">probe</span> <span class="ow">is</span> <span class="mh">0x1b12070d0</span> <span class="k">with</span> <span class="n">a</span> <span class="n">score</span> <span class="n">of</span> <span class="mf">17208.40</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="mi">17906</span> <span class="n">candidates</span> <span class="n">remaining</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Best</span> <span class="p">(</span><span class="n">approximated</span><span class="p">)</span> <span class="n">address</span> <span class="n">to</span> <span class="n">probe</span> <span class="ow">is</span> <span class="mh">0x1b8a353d8</span> <span class="k">with</span> <span class="n">a</span> <span class="n">score</span> <span class="n">of</span> <span class="mf">9144.48</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="mi">9656</span> <span class="n">candidates</span> <span class="n">remaining</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Best</span> <span class="p">(</span><span class="n">approximated</span><span class="p">)</span> <span class="n">address</span> <span class="n">to</span> <span class="n">probe</span> <span class="ow">is</span> <span class="mh">0x1bcb23de0</span> <span class="k">with</span> <span class="n">a</span> <span class="n">score</span> <span class="n">of</span> <span class="mf">5093.02</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="mi">5104</span> <span class="n">candidates</span> <span class="n">remaining</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Best</span> <span class="p">(</span><span class="n">approximated</span><span class="p">)</span> <span class="n">address</span> <span class="n">to</span> <span class="n">probe</span> <span class="ow">is</span> <span class="mh">0x1e172e3f8</span> <span class="k">with</span> <span class="n">a</span> <span class="n">score</span> <span class="n">of</span> <span class="mf">2754.83</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="mi">2682</span> <span class="n">candidates</span> <span class="n">remaining</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Best</span> <span class="p">(</span><span class="n">approximated</span><span class="p">)</span> <span class="n">address</span> <span class="n">to</span> <span class="n">probe</span> <span class="ow">is</span> <span class="mh">0x1b363c658</span> <span class="k">with</span> <span class="n">a</span> <span class="n">score</span> <span class="n">of</span> <span class="mf">1454.06</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="mi">1728</span> <span class="n">candidates</span> <span class="n">remaining</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Best</span> <span class="p">(</span><span class="n">approximated</span><span class="p">)</span> <span class="n">address</span> <span class="n">to</span> <span class="n">probe</span> <span class="ow">is</span> <span class="mh">0x1e0301200</span> <span class="k">with</span> <span class="n">a</span> <span class="n">score</span> <span class="n">of</span> <span class="mf">929.21</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="mi">915</span> <span class="n">candidates</span> <span class="n">remaining</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Best</span> <span class="p">(</span><span class="n">approximated</span><span class="p">)</span> <span class="n">address</span> <span class="n">to</span> <span class="n">probe</span> <span class="ow">is</span> <span class="mh">0x1b0c04368</span> <span class="k">with</span> <span class="n">a</span> <span class="n">score</span> <span class="n">of</span> <span class="mf">497.63</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="mi">593</span> <span class="n">candidates</span> <span class="n">remaining</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Best</span> <span class="p">(</span><span class="n">approximated</span><span class="p">)</span> <span class="n">address</span> <span class="n">to</span> <span class="n">probe</span> <span class="ow">is</span> <span class="mh">0x1e0263068</span> <span class="k">with</span> <span class="n">a</span> <span class="n">score</span> <span class="n">of</span> <span class="mf">319.15</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="mi">326</span> <span class="n">candidates</span> <span class="n">remaining</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Best</span> <span class="p">(</span><span class="n">approximated</span><span class="p">)</span> <span class="n">address</span> <span class="n">to</span> <span class="n">probe</span> <span class="ow">is</span> <span class="mh">0x1bec43868</span> <span class="k">with</span> <span class="n">a</span> <span class="n">score</span> <span class="n">of</span> <span class="mf">163.84</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="mi">156</span> <span class="n">candidates</span> <span class="n">remaining</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Best</span> <span class="p">(</span><span class="n">approximated</span><span class="p">)</span> <span class="n">address</span> <span class="n">to</span> <span class="n">probe</span> <span class="ow">is</span> <span class="mh">0x1c15ab0e8</span> <span class="k">with</span> <span class="n">a</span> <span class="n">score</span> <span class="n">of</span> <span class="mf">78.21</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="mi">82</span> <span class="n">candidates</span> <span class="n">remaining</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Best</span> <span class="p">(</span><span class="n">approximated</span><span class="p">)</span> <span class="n">address</span> <span class="n">to</span> <span class="n">probe</span> <span class="ow">is</span> <span class="mh">0x1c49efe90</span> <span class="k">with</span> <span class="n">a</span> <span class="n">score</span> <span class="n">of</span> <span class="mf">41.02</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="mi">40</span> <span class="n">candidates</span> <span class="n">remaining</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Best</span> <span class="p">(</span><span class="n">approximated</span><span class="p">)</span> <span class="n">address</span> <span class="n">to</span> <span class="n">probe</span> <span class="ow">is</span> <span class="mh">0x1befd60f8</span> <span class="k">with</span> <span class="n">a</span> <span class="n">score</span> <span class="n">of</span> <span class="mf">20.00</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="mi">20</span> <span class="n">candidates</span> <span class="n">remaining</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Best</span> <span class="p">(</span><span class="n">approximated</span><span class="p">)</span> <span class="n">address</span> <span class="n">to</span> <span class="n">probe</span> <span class="ow">is</span> <span class="mh">0x1c14089d0</span> <span class="k">with</span> <span class="n">a</span> <span class="n">score</span> <span class="n">of</span> <span class="mf">10.00</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="mi">10</span> <span class="n">candidates</span> <span class="n">remaining</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Best</span> <span class="p">(</span><span class="n">approximated</span><span class="p">)</span> <span class="n">address</span> <span class="n">to</span> <span class="n">probe</span> <span class="ow">is</span> <span class="mh">0x1c428d450</span> <span class="k">with</span> <span class="n">a</span> <span class="n">score</span> <span class="n">of</span> <span class="mf">5.00</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="mi">5</span> <span class="n">candidates</span> <span class="n">remaining</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Best</span> <span class="p">(</span><span class="n">approximated</span><span class="p">)</span> <span class="n">address</span> <span class="n">to</span> <span class="n">probe</span> <span class="ow">is</span> <span class="mh">0x1df0939f0</span> <span class="k">with</span> <span class="n">a</span> <span class="n">score</span> <span class="n">of</span> <span class="mf">2.60</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="mi">2</span> <span class="n">candidates</span> <span class="n">remaining</span><span class="p">...</span>
+<span class="p">[</span><span class="o">*</span><span class="p">]</span> <span class="n">Best</span> <span class="p">(</span><span class="n">approximated</span><span class="p">)</span> <span class="n">address</span> <span class="n">to</span> <span class="n">probe</span> <span class="ow">is</span> <span class="mh">0x1c3d255f8</span> <span class="k">with</span> <span class="n">a</span> <span class="n">score</span> <span class="n">of</span> <span class="mf">1.00</span>
+<span class="p">[</span><span class="o">+</span><span class="p">]</span> <span class="n">Shared</span> <span class="n">cache</span> <span class="ow">is</span> <span class="n">mapped</span> <span class="n">at</span> <span class="mh">0x1bf2b4000</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Gần như những oracle function có thể được xây dựng kể cả từ các lỗ hổng bộ nhớ khác nhau. Ví dụ như tất cả các lỗ hổng cho phép attacker làm hư hại hoặc giả mạo một ObjC object (<a href="https://bugs.chromium.org/p/project-zero/issues/detail?id=1881">CVE-2019–8641</a>, use-after-free <a href="https://bugs.chromium.org/p/project-zero/issues/detail?id=1873">CVE-2019–8647</a> và <a href="https://bugs.chromium.org/p/project-zero/issues/detail?id=1874">CVE-2019–8662</a>) cũng có thể sử dụng để xây dụng oracle function sau đó đưa vào ứng dụng như trên.</p>
+
+<p><em>(Trans: Phần này tác giả nói thêm về cách phương thức objc_release hoạt động và cách construct oracle function)</em></p>
+
+<p>Khi việc tham chiếu đến một ObjC object bị can thiệp, method <a href="https://github.com/opensource-apple/objc4/blob/cd5e62a5597ea7a31dccef089317abb3a661c154/runtime/NSObject.mm#L1505">objc_release</a> sẽ được gọi với object trên làm tham biến, nó sẽ kiểm tra xem object có “phương thức release đặc biệt” nào không bằng cách kiểm tra một bit trong Class object của object được tham chiếu đó (Class tham chiếu này được gọi là “ISA” (Is-a) pointer). Nếu object không có “phương thức release đặc biệt nào” thì nó sẽ giảm inline refcount (biến đếm phần tử) của object xuống, nếu kết quả không bằng ‘0’ -&gt; return. Ngược lại thì nó sẽ gọi destructor của object đó và memory chunk được giải phóng.</p>
+
+<pre><code class="language-objective-c">objc_release(id obj)
+{
+    if (!obj) return;
+    if (obj-&gt;isTaggedPointer()) return;
+    return obj-&gt;release();
+}
+</code></pre>
+
+<p>Nếu Class pointer của một object có thể được thay đổi để trỏ vào vùng shared cache, và đồng thời inline refcount &gt; 1, thì objc_release chỉ crash nếu “bit đặc biệt” được set tại một offset từ con trỏ đến giá trị. Bằng cách này, crash oracle có thể được reconstruct.</p>
+
+<h2 id="hỗ-trợ-các-phiên-bản-ios-và-hardware-model-khác-nhau">Hỗ trợ các phiên bản iOS và Hardware Model khác nhau</h2>
+
+<p>Attacker có thể build shared cache profile cho tất cả các hardware model và iOS version nếu không biết rõ về thông tin trên thiết bị của đối tượng nhắm đến. Việc này có thể cho khoảng vài trăm ngàn <code class="language-plaintext highlighter-rouge">base_address</code> nhưng nhờ vào sự “kì diệu” của thuật toán logarithm, kể cả khi số lượng lên đến hàng ngàn thì attacker chỉ cần gửi vài chục tin nhắn để xác định ra <code class="language-plaintext highlighter-rouge">base_address</code> cần tìm với shared cache, model number, version một cách chính xác.</p>
+
+<h1 id="lưu-ý-về-sự-ồn-ào-noisiness-của-việc-exploit">Lưu ý về sự ồn ào (noisiness) của việc exploit</h1>
+
+<p>Một điểm yếu khác của cách tấn công này là việc gây chú ý của nó. Trong khi crash vùng imagent mấy chục lần thì người dụng cũng không biết gì, tuy nhiên, thiết bị sẽ gửi crash report cho Apple nếu option “Share iPhone Analytics” được bật. Vì vậy, kĩ thuật này trở nên không hữu dụng lắm, nhưng may mắn rằng iOS sẽ ngưng việc log lại sau khi bị crash 25 lần</p>
+
+<div class="language-verilog highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><td class="rouge-gutter gl"><pre class="lineno">1
+2
+</pre></td><td class="rouge-code"><pre><span class="k">default</span> <span class="mi">14</span><span class="o">:</span><span class="mi">54</span><span class="o">:</span><span class="mf">42.957547</span> <span class="o">+</span><span class="mi">0200</span> <span class="n">ReportCrash</span> <span class="n">Formulating</span> <span class="n">report</span> <span class="k">for</span> <span class="n">corpse</span><span class="p">[</span><span class="mi">597</span><span class="p">]</span> <span class="n">imagent</span>
+<span class="k">default</span> <span class="mi">14</span><span class="o">:</span><span class="mi">54</span><span class="o">:</span><span class="mf">42.977891</span> <span class="o">+</span><span class="mi">0200</span> <span class="n">ReportCrash</span> <span class="n">Report</span> <span class="n">of</span> <span class="k">type</span> <span class="mb">'10</span><span class="mi">9</span><span class="p">(</span><span class="o">&lt;</span><span class="n">private</span><span class="o">&gt;</span><span class="p">)</span><span class="err">'</span> <span class="kt">not</span> <span class="n">saved</span> <span class="n">because</span> <span class="n">the</span> <span class="n">limit</span> <span class="n">of</span> <span class="mi">25</span> <span class="n">logs</span> <span class="n">has</span> <span class="n">been</span> <span class="n">reached</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Ta có thể thử DoS (VD như thực hiện đệ quy nhiều lần dẫn đến tràn bộ đệm) để crash imagent 25 lần trước khi thực hiện exploit để không bị iOS log lại. <em>Tuy nhiên cách này vẫn chưa được xác thực trong thực tế</em>.</p>
+
+<h1 id="vấn-đề-với-automatic-delivery-receipts">Vấn đề với Automatic Delivery Receipts</h1>
+
+<p>Như đã trình bày ở trên, việc bypass ASLR bằng cách tạo một side channel để gửi tin nhắn tự động từ thiết bị đến máy chủ của người tấn công là khả thi. Để vá lỗi này không chỉ đơn giản như kiểu: Gửi delivery receipt <strong>trước</strong> khi parse bất cứ thứ gì phức tạp, từ đó message vẫn được gửi đi mặc kệ việc payload có làm crash gì đi nữa. Tuy nhiên. cách này không bao quát được toàn bộ, kiểu tấn công sau đây vẫn có thể hoạt động như thường:</p>
+
+<ol>
+  <li>Gửi “oracle” message (cái mà gây crash) 2-3 lần liên tiếp</li>
+  <li>Gửi một tin nhắn “bình thường” (không gây crash)</li>
+  <li>Canh thời gian khi delivery receipt được gửi tới. Nếu nó lâu hơn một vài giây thì chắc hẳn vùng <code class="language-plaintext highlighter-rouge">imagent</code> đã crash từ bước 1 và việc gửi bị delay bởi launchd</li>
+</ol>
+
+<p>Cách tấn công này đã ép buộc launchd phải restart và delay. Phương thức này cũng có thể tồn tại trên một số platform khác. Chính vì thế, ta hiểu được rằng bất kì tin nhắn tự động nào được gửi từ phía victim thì luôn có thể bị khai thác như cách trên. Cách giải quyết tốt nhất bây giờ là không cho bất kì tin nhắn nào được gửi một cách tự động cả, hoặc ít nhất phải có tác động của người dùng.</p>
+
+<p>Phần hai của series <em>Remote iPhone Exploitation</em> sẽ kết thúc tại đây. Hẹn gặp các bạn ở phần tiếp theo.</p>
+:ET

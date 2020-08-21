@@ -10,7 +10,7 @@
 
 title: Another infosec blog                          # the main title
 
-tagline: I break things and create stuff that break things.  # it will display as the sub-title
+tagline: It's filled with computer noise and wierd stuff.  # it will display as the sub-title
 
 description: >-                        # used by seo meta and the atom feed
   A weird blog filled with
@@ -77,7 +77,7 @@ disqus:
 #
 #     dark   - Use the dark color scheme
 #
-theme_mode: dark
+theme_mode: dual
 
 # boolean type, global switch for ToC in posts.
 toc: true

@@ -1,0 +1,201 @@
+I"y0<p>Trong bài viết này, mình sẽ giúp các bạn decompile một vài phương thức tối ưu của compiler.</p>
+
+<p><img src="https://miro.medium.com/max/850/0*kmssB7j1LbCF5h71.png" alt="Image for post" /></p>
+
+<p>Khi dịch ngược một chương trình đã được tối ưu hóa thường tốn rất nhiều thời gian. Bằng cách tìm hiểu phương thức tối ưu của các compiler, chúng ta có thể đẩy nhanh tiến độ của mình và tiết kiệm được kha khá thời gian.</p>
+
+<h1 id="thay-thế-phép-chia-bằng-phép-nhân">Thay thế phép chia bằng phép nhân</h1>
+
+<p><em>Đừng lo, không có gì cao siêu trong phần này đâu.</em></p>
+
+<p>Trong khi đang dịch ngược một con rootkit, mình đã phát hiện một đoạn mã assembly trông có vẻ “lạ”:</p>
+
+<pre><code class="language-assembly">mov     ecx, dword ptr [X]        
+mov     rax, 0x3333333333333400          
+mul     rcx
+</code></pre>
+
+<p>Mỗi khi nhìn thấy những đoạn mã như thế này, mình thường tự hỏi rằng: Liệu có phải mấy ông dev viết cái thứ này không? Và sau khi tìm hiểu đoạn mã này làm gì, mình đã nhận ra đây là một phương thức tối ưu của compiler — Đoạn mã này đơn giản là thực hiện một phép chia mà không sử dụng ‘div’ (<a href="http://www.c-jump.com/CIS77/MLabs/M11arithmetic/M11_0080_div_instruction.htm">division instruction</a>). Phép chia là một lệnh rất “đắt đỏ” và “tốn kém” cho CPU — thậm chí còn hơn cả phép nhân luôn. Bây giờ chúng ta hãy tìm hiểu compiler đã tối ưu hóa điều này như thế nào nhé.</p>
+
+<p>Giả sử ta muốn chia X cho 5. Trong toán học, (X/5) = (X<em>(1/5)). Từ đó ai cũng có thể suy ra rằng chúng ta có thể đảo ngược 5 thành 1/5 rồi sử dụng phép nhân là đã có kết quả của phép chia ban đầu. Nhưng điều thắc mắc là: *1/5 là một số thực, làm sao ta có thể biểu diễn nó mà không sử dụng dấu thập phân?</em></p>
+
+<p>Ta có thể sử dụng lệnh <a href="https://www.aldeid.com/wiki/X86-assembly/Instructions/mul">mul</a>: Lệnh dùng để thực hiện phép nhân giữa thanh ghi rax và một toán hạng (operand). Nếu các toán hạng là 64-bit, kết quả của phép nhân có thể là 128-bit. Vì vậy sau khi tính, ‘mul’ trữ kết quả vào 2 thanh ghi (register):</p>
+
+<ul>
+  <li>rax — phần 64-bit “dưới” của kết quả</li>
+  <li>rdx — phần 64-but “trên” của kết quả</li>
+</ul>
+
+<p>Đây là pseudo-code của lệnh ‘mul’:</p>
+
+<div class="language-c++ highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><!-- <td class="rouge-gutter gl"><pre class="lineno">1
+2
+3
+4
+5
+6
+7
+8
+</pre></td> --><td class="rouge-code"><pre><span class="kt">void</span> <span class="nf">mul</span><span class="p">(</span><span class="kt">uint64_t</span> <span class="n">operand</span><span class="p">)</span> <span class="p">{</span> 
+    <span class="n">__int128</span> <span class="n">result</span> <span class="o">=</span> <span class="p">(</span><span class="n">rax</span> <span class="o">*</span> <span class="n">operand</span><span class="p">);</span>
+    <span class="c1">// take the lower 64 bits and store in rax</span>
+    <span class="n">rax</span> <span class="o">=</span> <span class="p">(</span><span class="n">result</span> <span class="o">&amp;</span> <span class="mh">0xffffffffffffffff</span><span class="p">);</span>
+
+    <span class="c1">// store the upper 64 bits and store in rdx</span>
+    <span class="n">rdx</span> <span class="o">=</span> <span class="p">(</span><span class="n">result</span> <span class="o">&gt;&gt;</span> <span class="mi">64</span><span class="p">)</span> <span class="o">&amp;</span> <span class="mh">0xffffffffffffffff</span><span class="p">;</span>                
+<span class="p">}</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Vậy ta sử dụng ‘mul’ như thế nào để thực hiện phép toán (X*(1/5))?</p>
+
+<p>Giờ mình sẽ biểu diễn số thập phân như thế này: thanh ghi rax sẽ giữ toàn bộ phần số nguyên và thanh ghi rdx sẽ giữ phần thập phân.</p>
+
+<p>Ở phần này, 2⁶⁴ sẽ đại diện cho giá trị 1:</p>
+
+<div class="language-c++ highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><!-- <td class="rouge-gutter gl"><pre class="lineno">1
+2
+3
+4
+</pre></td> --><td class="rouge-code"><pre><span class="n">fractional_part</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="n">whole_number</span>    <span class="o">=</span> <span class="mi">1</span>
+
+<span class="n">full_representation</span><span class="o">:</span> <span class="mi">0</span><span class="n">x</span> <span class="mf">0000000000000001.0000000000000000</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Để viết được 1/5, chúng ta phải chia 2⁶⁴ cho 5.0:
+\(2^{64} / 5.0 =  0x3333333333333400\)
+<em>Lưu ý khi thực hiện những phép tính này, hãy để ý việc làm tròn số.</em></p>
+
+<p>Okay, <code class="language-plaintext highlighter-rouge">0x3333333333333400</code> là giá trị ta cần tìm rồi. Bây giờ ta sẽ thử chia 10 cho 5 nhé:</p>
+
+<div class="language-plaintext highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><!-- <td class="rouge-gutter gl"><pre class="lineno">1
+2
+3
+4
+5
+</pre></td> --><td class="rouge-code"><pre>0x0000000000000000 0x000000000000000A (10)
+                  *
+0x0000000000000000 0x3333333333333400 (0.2)
+                  =
+0x0000000000000002 0x0000000000000000 (2)
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Để có được kết quả là 2, ta phải dịch (shift) kết quả sang phải 64 bits. Lí do toán hạng đầu tiên (10) không bị dịch là vì ta đã dịch toán hạng thứ hai rồi.</p>
+
+<p>Tiếp theo, hãy thử xài cách trên để tối ưu hóa phép chia như sau:</p>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><!-- <td class="rouge-gutter gl"><pre class="lineno">1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+</pre></td> --><td class="rouge-code"><pre><span class="c1">//</span>
+<span class="c1">// Real calculation:</span>
+<span class="c1">//</span>
+<span class="n">Result</span> <span class="o">=</span> <span class="p">(</span><span class="n">X</span> <span class="o">/</span> <span class="mi">5</span><span class="p">.</span><span class="mi">0</span><span class="p">)</span>
+
+<span class="c1">//</span>
+<span class="c1">// Calculation Using Multiplication:</span>
+<span class="c1">//</span>
+<span class="n">Result</span> <span class="o">=</span> <span class="p">(</span><span class="n">X</span> <span class="o">*</span> <span class="p">(</span><span class="mi">1</span><span class="o">/</span><span class="mi">5</span><span class="p">.</span><span class="mi">0</span><span class="p">))</span>
+
+<span class="c1">//</span>
+<span class="c1">// Calculation using our decimal representation: </span>
+<span class="c1">//</span>
+<span class="n">Result</span> <span class="o">=</span> <span class="p">(</span><span class="n">X</span> <span class="o">*</span> <span class="mh">0x3333333333333400</span><span class="p">)</span> <span class="o">&gt;&gt;</span> <span class="mi">64</span>
+
+
+<span class="c1">//</span>
+<span class="c1">// Calulation using assembly:</span>
+<span class="c1">//</span>
+<span class="kr">__asm</span> <span class="p">{</span>
+
+	<span class="c1">// Store (2^64 / 5.0) in rcx</span>
+	<span class="n">mov</span> <span class="n">rcx</span><span class="p">,</span> <span class="mh">0x3333333333333400</span> 
+
+	<span class="c1">// Store X in rax.</span>
+	<span class="n">mov</span> <span class="n">rax</span><span class="p">,</span> <span class="n">qword</span> <span class="n">ptr</span> <span class="p">[</span><span class="n">X</span><span class="p">]</span> 
+
+	<span class="c1">// Multiply.</span>
+	<span class="c1">// The result of the multiplication is stored in 	rdx, which stores the higher 64 bits.</span>
+	<span class="n">mul</span> <span class="n">rcx</span>
+<span class="p">}</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Phần assembly code này cơ bản chính là đoạn mã “kì lạ” mà mình đã nói đến ở đầu bài viết này đấy ;)</p>
+
+<p>Sử dụng mánh này ta đã có thể chia mà không cần xài ‘div’ rồi.</p>
+
+<h1 id="ví-dụ-thực-nghiệm">Ví dụ thực nghiệm</h1>
+
+<p>Hãy nhìn vào đoạn assembly sau:</p>
+
+<pre><code class="language-assembly">mov     rcx, qword ptr [X]
+mov     rax, 0xCCCCCCCCCCCCCCCD
+mul     rcx
+mov     rdi, rdx
+shr     rdi, 4
+</code></pre>
+
+<p>Làm sao để dịch ngược đoạn này đây? Đầu tiên ta phải biết được <code class="language-plaintext highlighter-rouge">0xCCCCCCCCCCCCCCCD</code> là gì đã. Mình sẽ đảo ngược nó như thế này:</p>
+
+<div class="language-python highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><!-- <td class="rouge-gutter gl"><pre class="lineno">1
+2
+</pre></td> --><td class="rouge-code"><pre><span class="o">&gt;&gt;&gt;</span> <span class="mh">0xCCCCCCCCCCCCCCCD</span> <span class="o">/</span> <span class="nb">float</span><span class="p">(</span><span class="mi">2</span><span class="o">**</span><span class="mi">64</span><span class="p">)</span>
+<span class="mf">0.8</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Giờ ta đã biết được lệnh ‘mul’ đầu tiên sẽ nhân X với 0.8 (4/5) và lưu kết quả vào thanh rdx. Sau đó, có lệnh dịch phải 4 bit — có nghĩa là chia cho (2⁴) = 16.</p>
+
+<p>Phép tính tổng quát:</p>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><!-- <td class="rouge-gutter gl"><pre class="lineno">1
+</pre></td> --><td class="rouge-code"><pre><span class="n">Result</span> <span class="o">=</span> <span class="p">(</span><span class="n">X</span> <span class="o">*</span> <span class="mi">4</span><span class="o">/</span><span class="mi">5</span><span class="p">)</span> <span class="o">/</span> <span class="mi">16</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Ta có thể đổi lại như thế này:</p>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><!-- <td class="rouge-gutter gl"><pre class="lineno">1
+</pre></td> --><td class="rouge-code"><pre><span class="p">(</span><span class="n">X</span> <span class="o">*</span> <span class="mi">4</span><span class="o">/</span><span class="mi">5</span> <span class="o">*</span> <span class="mi">1</span><span class="o">/</span><span class="mi">16</span><span class="p">)</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Sau đó ghép 2 phép nhân lại:</p>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><!-- <td class="rouge-gutter gl"><pre class="lineno">1
+</pre></td> --><td class="rouge-code"><pre><span class="p">(</span><span class="n">X</span> <span class="o">*</span> <span class="mi">4</span><span class="o">/</span><span class="mi">80</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="p">(</span><span class="n">X</span> <span class="o">*</span> <span class="mi">1</span><span class="o">/</span><span class="mi">20</span><span class="p">)</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Vậy là ta đã biết đoạn mã trên đơn giản là chia X cho 20.</p>
+
+<h1 id="summary">Summary</h1>
+
+<p>Hy vọng là bài viết này hữu ích. Mình sẽ tiếp tục dăng những bài liên quan đến RE, có thể là cả mấy bài pwn nữa nếu mình không lười hihi.</p>
+
+<p>Thanks for reading!</p>
+:ET

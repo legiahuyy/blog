@@ -1,0 +1,87 @@
+I"�#<p>Bài này được mình dịch từ blog của team <a href="https://googleprojectzero.blogspot.com/2020/01/remote-iphone-exploitation-part-3.html">Google Project Zero</a>.</p>
+
+<p>Đây là phần cuối trong series exploit iMessage trên iOS. Ở phần một ta đã giới thiệu sơ lược về lỗ hổng và phần hai đi sâu vào các phương pháp tấn công như heapspray, leak base address, …</p>
+
+<p>Tới phần ba này, như ta đã biết, ASLR đã được bypass, base address của shared cache đã nằm trong tay và controlled data có thể được xếp vào một địa chỉ chính xác. Điều còn lại ta cần làm là exploit lỗ hổng thêm một lần nữa để chiếm quyền điều khiển.</p>
+
+<p><strong>Sơ lược</strong>: Mở đầu phần ba sẽ giới thiệu ngắn về việc sử dụng ObjC để khai thác các thiết bị không có xác thực con trỏ (Pointer Authentication - PAC), tiếp đó là đi sâu vào một cách khai thác có thể hoạt động kể cả khi PAC được kích hoạt. Cuối cùng sẽ là kỹ thuật xâu chuỗi lại các kiểu tấn công với Javascript kernel exploit.</p>
+
+<h1 id="objective-c-remote-code-executer">Objective-C Remote Code Executer</h1>
+
+<p>ObjC là một superset của C với các tính năng lập trình hướng đối tượng. ObjC cho chúng ta concept về đối tượng, các lớp với method và property cũng như tính kế thừa cho ngôn ngữ. Hầu hết các đối tượng trong ObjC đều kế thừa từ một lớp cơ sở là <code class="language-plaintext highlighter-rouge">NSObject</code>. Sau đây là một code snippet đơn giản của ObjC:</p>
+
+<div class="language-objc highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><td class="rouge-gutter gl"><pre class="lineno">1
+2
+</pre></td><td class="rouge-code"><pre>  <span class="n">Bob</span><span class="o">*</span> <span class="n">bob</span> <span class="o">=</span> <span class="p">[[</span><span class="n">Bob</span> <span class="nf">alloc</span><span class="p">]</span> <span class="nf">init</span><span class="p">];</span>
+  <span class="p">[</span><span class="n">bob</span> <span class="nf">doSomething</span><span class="p">];</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Đoạn snippet trên khởi tạo một instance của một lớp, sau đó gọi một method.</p>
+
+<p>ObjC quản lý rất chặt đối với thời hạn (lifetime) của các object. Vì thế, mọi object đều có một bộ đếm tham chiếu (refcount) tồn tại <a href="https://github.com/opensource-apple/objc4/blob/cd5e62a5597ea7a31dccef089317abb3a661c154/runtime/objc-private.h#L93">inline</a> hoặc trong một <a href="https://github.com/opensource-apple/objc4/blob/cd5e62a5597ea7a31dccef089317abb3a661c154/runtime/NSObject.mm#L201">global table</a>. Khi làm việc với một object, đoạn code phải thực thi hai lệnh gọi là <a href="https://developer.apple.com/documentation/objectivec/1418956-nsobject/1571946-retain?language=objc">obj_retain</a> và <a href="https://developer.apple.com/documentation/objectivec/1418956-nsobject/1571957-release?language=objc">objc_release</a> lên object. Hai hàm này phải được thêm thủ công bởi lập trình viên hoặc <a href="https://en.wikipedia.org/wiki/Automatic_Reference_Counting">tự động bằng compiler</a>.</p>
+
+<p>Trong nội bộ, một object của ObjC là một chunk memory (thường được khởi tạo bằng <code class="language-plaintext highlighter-rouge">alloc</code>) luôn bắt đầu với một <a href="https://github.com/opensource-apple/objc4/blob/cd5e62a5597ea7a31dccef089317abb3a661c154/runtime/objc-private.h#L59">giá trị “ISA”</a> và theo sau bởi các biến hoặc property. Giá trị ISA là một giá trị kiểu con trỏ có chứa thông tin sau:</p>
+
+<ul>
+  <li>Một con trỏ đến Lớp của object</li>
+  <li>Một inline refcount</li>
+  <li>Một vài flag bit</li>
+</ul>
+
+<p>Một <a href="https://github.com/opensource-apple/objc4/blob/cd5e62a5597ea7a31dccef089317abb3a661c154/runtime/objc-runtime-new.h#L1012">lớp ObjC</a> mô tả instance của nó và chính nó. Các lớp trong ObjC không chỉ là một khái niệm compile-time mà chúng cũng tồn tại ở runtime. Một lớp chứa các thông tin sau:</p>
+
+<ul>
+  <li>Chữ ISA (do nó là một ObjC Object), trỏ đến một metaclass tương ứng</li>
+  <li>Một con trỏ trỏ đến một lớp cha nếu có</li>
+  <li>Một method cache để tăng tốc method implementation lookups</li>
+  <li>Method table</li>
+  <li>Danh sách các instance variable (tên và offset)</li>
+</ul>
+
+<p>Một <a href="https://github.com/opensource-apple/objc4/blob/cd5e62a5597ea7a31dccef089317abb3a661c154/runtime/objc-runtime-new.h#L207">method</a> trong ObjC đơn giản là một tuple:</p>
+
+<p>(<a href="https://developer.apple.com/documentation/objectivec/sel?language=objc">Selector</a>, <a href="https://developer.apple.com/documentation/objectivec/objective-c_runtime/imp?language=objc">Implementation</a>)</p>
+
+<p>với Selector là một chuỗi C-String duy nhất chứa tên của method và Implementation là một con trỏ đến native function của method.</p>
+
+<p>Dưới đây là những gì sẽ xảy ra khi đoạn code khi nãy được compile và thực thi: Đầu tiên, ở compile-time, ba lệnh gọi method ObjC được dịch sang một đoạn pseudo-C (giả sử ARC đang được kích hoạt):</p>
+
+<pre><code class="language-pseudocode">Bob* bob = objc_msgSend(BobClass, "alloc");
+// Refcount is already 1 at this point, so no need for a objc_retain()
+bob = objc_msgSend(bob, "init");
+objc_msgSend(bob, "doSomething");
+...
+objc_release(bob);
+</code></pre>
+
+<p>Trong runtime, <a href="https://github.com/opensource-apple/objc4/blob/cd5e62a5597ea7a31dccef089317abb3a661c154/runtime/Messengers.subproj/objc-msg-arm64.s#L252">objc_msgSend</a> sẽ thực thi:</p>
+
+<ol>
+  <li>Truy cập vào vùng nhớ của con trỏ để thu giá trị ISA và extract Class pointer</li>
+  <li>Thực hiện việc <a href="https://github.com/opensource-apple/objc4/blob/cd5e62a5597ea7a31dccef089317abb3a661c154/runtime/objc-runtime-new.mm#L4657">tìm kiếm method implementation</a> trong method cache của Lớp.</li>
+  <li>Nếu bước 2 thất bại, tiếp tục tìm method trong method table</li>
+  <li>Nếu một method Implementation được tìm tháy, nó sẽ được gọi (đuôi - Tailed Call) với những tham số từ objc_msgSend. Nếu fail thì sẽ throw exception.</li>
+</ol>
+
+<p>Lưu ý rằng vì các selector là unique trong runtime, so sánh hai selector với nhau có thể được đơn giản bằng việc so sánh giá trị của hai con trỏ tương ứng,</p>
+
+<p>Mặt khác, <a href="https://github.com/opensource-apple/objc4/blob/cd5e62a5597ea7a31dccef089317abb3a661c154/runtime/NSObject.mm#L1505">objc_release</a> sẽ <a href="https://github.com/opensource-apple/objc4/blob/cd5e62a5597ea7a31dccef089317abb3a661c154/runtime/objc-object.h#L464">giảm refcount</a> của object. Nếu như refcount của object đã bằng không thì nó sẽ <a href="https://github.com/opensource-apple/objc4/blob/cd5e62a5597ea7a31dccef089317abb3a661c154/runtime/objc-object.h#L571">gọi</a> method <a href="https://developer.apple.com/documentation/objectivec/nsobject/1571947-dealloc">dealloc_method</a> (deconstructor của object) và sau đó giải phóng object memory chunk.</p>
+
+<p>Một số thông tin khác có thể tìm thấy ở <a href="http://www.phrack.org/issues/66/4.html#article">đây</a>, <a href="http://www.phrack.org/issues/69/9.html#article">đây</a> và trong <a href="https://github.com/opensource-apple/objc4">source</a>/<a href="https://ipsw.me/">binary</a> code.</p>
+
+<h2 id="native-code-execution-trên-các-thiết-bị-non-pac">Native Code Execution trên các Thiết bị non-PAC</h2>
+
+<p>Qua những kiến thức có được về ObjC trên kết hợp với những thứ có được ở phần hai của series, ta có thể implement một exploit đơn giản để trigger NCE trên các thiết bị non-PAC, nổi bật là iPhone X và những đời trước.</p>
+
+<p>Sau đây là một đoạn code nhỏ từ <code class="language-plaintext highlighter-rouge">[NSSharedKeyset indexForKey:]</code>. Đoạn code này sẽ lược qua các giá trị phù hợp do người tấn công chọn (với <code class="language-plaintext highlighter-rouge">_keys</code> là nullptr và <code class="language-plaintext highlighter-rouge">index </code>đã được kiểm soát) và xử lý chúng.</p>
+
+<pre><code class="language-objective-c">id candidate = self-&gt;_keys[index];
+  if (candidate != nil) {
+    if ([key isEqual:candidate]) {
+      return prevLength + index;
+    }
+  }
+</code></pre>
+<p>Nếu key là môt NSString, thì</p>
+
+:ET

@@ -2,8 +2,8 @@
 title: Di cư từ Medium sang Github Page
 author: Huy
 date: 2020-08-20 6:36:22 +1345
-categories: [Miscs]
 tags: [thoughts]
+pin: true
 lastmod: 2020-08-21 00:36:56 +1345
 ---
 

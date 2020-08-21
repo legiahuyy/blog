@@ -1,0 +1,23 @@
+I"#
+<p>Bài này được mình dịch từ blog của team <a href="https://googleprojectzero.blogspot.com/2020/01/remote-iphone-exploitation-part-3.html">Google Project Zero</a>.</p>
+
+<p>Đây là phần cuối trong series exploit iMessage trên iOS. Ở phần một ta đã giới thiệu sơ lược về lỗ hổng và phần hai đi sâu vào các phương pháp tấn công như heapspray, leak base address, …</p>
+
+<p>Tới phần ba này, như ta đã biết, ASLR đã được bypass, base address của shared cache đã nằm trong tay và controlled data có thể được xếp vào một địa chỉ chính xác. Điều còn lại ta cần làm là exploit lỗ hổng thêm một lần nữa để chiếm quyền điều khiển.</p>
+
+<p><strong>Sơ lược</strong>: Mở đầu phần ba sẽ giới thiệu ngắn về việc sử dụng ObjC để khai thác các thiết bị không có xác thực con trỏ (Pointer Authentication - PAC), tiếp đó là đi sâu vào một cách khai thác có thể hoạt động kể cả khi PAC được kích hoạt. Cuối cùng sẽ là kỹ thuật xâu chuỗi lại các kiểu tấn công với Javascript kernel exploit.</p>
+
+<h1 id="objective-c-remote-code-executer">Objective-C Remote Code Executer</h1>
+
+<p>ObjC là một superset của C với các tính năng lập trình hướng đối tượng. ObjC cho chúng ta concept về đối tượng, các lớp với method và property cũng như tính kế thừa cho ngôn ngữ. Hầu hết các đối tượng trong ObjC đều kế thừa từ một lớp mẹ là <code class="language-plaintext highlighter-rouge">NSObject</code>. Sau đây là một code snippet đơn giản của ObjC:</p>
+
+<div class="language-objc highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><td class="rouge-gutter gl"><pre class="lineno">1
+2
+</pre></td><td class="rouge-code"><pre>  <span class="n">Bob</span><span class="o">*</span> <span class="n">bob</span> <span class="o">=</span> <span class="p">[[</span><span class="n">Bob</span> <span class="nf">alloc</span><span class="p">]</span> <span class="nf">init</span><span class="p">];</span>
+  <span class="p">[</span><span class="n">bob</span> <span class="nf">doSomething</span><span class="p">];</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Đoạn snippet trên khởi tạo một instance của một lớp, sau đó gọi một method.</p>
+
+<p>ObjC quản lý rất chặt đối với thời hạn (lifetime) của các object.</p>
+:ET

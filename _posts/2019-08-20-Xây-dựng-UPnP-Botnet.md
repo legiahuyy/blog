@@ -2,8 +2,7 @@
 title: Xây dựng UPnP Botnet
 author: Huy
 date: 2019-11-22 9:55:22 +0800
-categories: [Technical]
-tags: [network, reverse engineer]
+tags: [network]
 ---
 
 Cách tạo botnet 100% anonymity qua hàng loạt các thiết bị IoT bằng cách “sử dụng” mô hình giao thức UPnP.

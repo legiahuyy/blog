@@ -1,0 +1,432 @@
+I"��<p>Bài viết này được mình dịch từ blog của team <a href="https://googleprojectzero.blogspot.com/2020/01/remote-iphone-exploitation-part-1.html">Google Project Zero</a>.</p>
+
+<p><strong>Lưu ý:</strong> Bài viết gốc của tác giả có rất nhiều những từ chuyên ngành dịch sang tiếng Việt nghe rất …oải và không trọn vẹn nghĩa nên mình sẽ để nguyên. Ngoài ra mình cũng có thêm một số giải thích để giúp bạn đọc hiểu rõ hơn về nghiên cứu của tác giả cũng như các từ chuyên môn trong bài. Enjoy!</p>
+
+<h1 id="lời-mở-đầu">Lời mở đầu</h1>
+
+<p>Đây là blog post đầu trong series <em>Remote iPhone Exploitation.</em> Trong series này, chúng ta sẽ đi chi tiết về lỗ hổng trên iMessage có thể bị khai thác từ xa mà không cần user phải “đụng chân đụng tay”. Lỗ hổng này tồn tại ở phiên bản iOS 12.4 (hiện đã được vá trong iOS 12.4.1 hồi tháng 8/2019). Bạn đọc có thể tìm hiểu thêm <a href="https://media.ccc.de/v/36c3-10497-messenger_hacking_remotely_compromising_an_iphone_through_imessage"><em>tại đây</em></a><em>.</em></p>
+
+<p>Phần một sẽ cung cấp cho chúng ta thông tin về lỗ hổng, phần tiếp theo sẽ nói về kỹ thuật bypass ASLR (<strong>A</strong>ddress <strong>S</strong>pace <strong>L</strong>ayout <strong>R</strong>andomization) và phần cuối cùng sẽ giải thích cách thực hiện RCE (<strong>R</strong>emote <strong>C</strong>ode <strong>E</strong>xecution — thực thi mã lệnh từ xa).</p>
+
+<p>Với việc khai thác lỗ hổng trên, người tấn công chỉ cần có được Apple ID (số điện thoại hoặc email) thì sẽ kiểm soát được hoàn toàn thiết bị iOS của nạn nhân. Kế tiếp, kẻ xấu có thể can thiệp vào toàn bộ file, mật khẩu, mã xác minh, tin nhắn (SMS/etc), email và những thông tin khác. Chúng cũng có thể bật/tắt microphone và camera của thiết bị mà người dùng không hề hay biết vì không có bất cứ thông báo nào xuất hiện cả. Chỉ bằng cách khai thác một lỗ hổng duy nhất — <a href="https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2019-8641">CVE-2019–8641</a>, ta có thể bypass ASLR rồi thực thi mã ngầm bên ngoài <a href="https://genk.vn/may-tinh/tim-hieu-ve-sandbox-hop-cat-bao-ve-an-toan-cho-may-tinh-cua-ban-20131029225422614.chn">sandbox</a> trên thiết bị.</p>
+
+<p>Bài viết này, đồng thời cũng là để giải đáp cho câu hỏi:</p>
+
+<blockquote>
+  <p>Chỉ với một lỗ hổng về bộ nhớ, liệu ta có được RCE trên thiết bị iOS mà không cần khai thác thêm bất kì lỗ hổng nào hay không?</p>
+</blockquote>
+
+<p>Câu trả lời là có, và giờ ta sẽ chứng minh.</p>
+
+<h2 id="cve-20198641">CVE-2019–8641</h2>
+
+<p>Lỗ hổng được tìm thấy trong một dự án tìm lỗ hổng chung với Natalie Silvanovich và đã <a href="https://bugs.chromium.org/p/project-zero/issues/detail?id=1917">báo cáo cho Apple vào 29/7/2019</a>, tiếp đó là PoC (Proof-of-Concept — nói đơn giản là chứng minh tính khả thi của việc khai thác) được gửi đi vào 9/8/2019. Lỗ hổng được Apple “vá tạm” bằng cách <a href="https://twitter.com/5aelo/status/1172534071332917248">chặn truy cập đến đoạn code có lỗ hổng</a>, sau đó được sửa hoàn toàn trên iOS 13.2.</p>
+
+<p>Dành cho những ai muốn nghiên cứu, đây là <a href="https://bugs.chromium.org/p/project-zero/issues/detail?id=1917#c6">PoC trên iOS 12.4</a> của iPhone XS.</p>
+
+<h1 id="mô-hình-hoạt-động-của-imessage">Mô hình hoạt động của iMessage</h1>
+
+<p>Những tin nhắn iMessage trước khi dến được với người dùng thì nó phải đi qua nhiều những service (dịch vụ) và framework. Main service xử lý những tin nhắn iMessage trên iOS 12.4 mà không cần sự tương tác của người dùng được biểu diễn như sau:</p>
+
+<p><img src="https://miro.medium.com/max/800/0*_frn4sUkDCN8rQes.png" alt="Các ô được khoanh đỏ là những tiến trình chạy trong sandbox của iOS" style="zoom:80%;" /></p>
+
+<p>Những đối tượng bên ngoài sandbox mà ta có thể khai thác bao gồm <a href="https://developer.apple.com/documentation/foundation/nskeyedunarchiver?language=objc">NSKeyedUnarchiver API</a> và data format của iMessage. Sau khi tìm hiểu, lỗ hổng trong NSKeyedUnarchiver API có thể được “kích hoạt” bằng hai cách:</p>
+
+<ul>
+  <li>Trong tiến trình <strong>imagent</strong>.</li>
+  <li>Ngoài sandbox, trong phần <strong>SpringBoard</strong> (tiến trình quản lí giao diện iOS, bao gồm màn hình khóa).</li>
+</ul>
+
+<p>Cả hai cách này đều có điểm có lợi và bất lợi cho việc khai thác. Ví dụ, trong khi SpringBoard có thể chạy bên ngoài sandbox nhưng nó cũng sẽ hiện thông báo “respring” trên thiết bị việc ta can thiệp làm hệ thống bị crash (ai vọc jaibreak nhiều sẽ biết). Imagent thì không như thế nhưng nó lại nằm trong sandbox — mọi thay đổi sẽ bị xóa khi người dùng restart.</p>
+
+<p>Trong bản vá iOS 13, việc decode data của NSKeyedUnarchiver không còn xảy ra trên SpringBoard nữa mà là trong sandbox IMDPersistenceAgent.</p>
+
+<h2 id="exploit-imessage">Exploit iMessage</h2>
+
+<p>Để có thể gửi exploit qua iMessage, ta phải có khả năng gửi tin nhắn tùy chỉnh (custom message) đến mục tiêu. Điều này đòi hỏi việc phải tương tác với server của Apple và xử lý E2E (end-to-end) encryption của iMessage. Tuy nhiên, có một cách đơn giản hơn để làm điều này đó là “tái sử dụng” code xử lí trong <strong>imagent</strong> của iMessage. Công cụ như <a href="https://frida.re/">frida</a> có thể giúp ta gửi đoạn tin nhắn custom đó trên MacOS như sau:</p>
+
+<ol>
+  <li>Build một payload (để “kích hoạt” bug của NSKeyedUnarchiver) và lưu nó vào disk.</li>
+  <li>Sử dụng AppleScript để ra hiệu cho <a href="http://messages.app/">Messages.app</a> (một dịch vụ giả lập iMessage mà hình như đã bị gỡ xuống) gửi một tin nhắn bất kì (VD: “REPLACEME”) đến mục tiêu.</li>
+  <li>Hook <strong>imagent</strong> bằng frida và thay thế tin nhắn được gửi đi bằng payload vừa tạo.</li>
+</ol>
+
+<p>Cũng bằng cách này ta có thể nhận tin nhắn bằng cách sử dụng frida để hook hàm <em>receiver</em> trong <strong>imagent</strong>.</p>
+
+<p>Đoạn mã dưới đây là ví dụ, dòng tin nhắn iMessage (encode <a href="https://en.wikipedia.org/wiki/Property_list#macOS">binary plist</a>) sẽ được gửi đến người nhận với nội dung “REPLACEME”:</p>
+
+<div class="language-objc highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><!-- <td class="rouge-gutter gl"><pre class="lineno">1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+</pre></td> --><td class="rouge-code"><pre><span class="p">{</span>
+    <span class="n">gid</span> <span class="o">=</span> <span class="s">"008412B9-A4F7-4B96-96C3-70C4276CB2BE"</span><span class="p">;</span>
+    <span class="n">gv</span> <span class="o">=</span> <span class="mi">8</span><span class="p">;</span>
+    <span class="n">p</span> <span class="o">=</span>     <span class="p">(</span>
+        <span class="s">"mailto:sender@foo.bar"</span><span class="p">,</span>
+        <span class="s">"mailto:receiver@foo.bar"</span>
+    <span class="p">);</span>
+    <span class="n">pv</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+    <span class="n">r</span> <span class="o">=</span> <span class="s">"6401430E-CDD3-4BC7-A377-7611706B431F"</span><span class="p">;</span>
+    <span class="n">t</span> <span class="o">=</span> <span class="s">"REPLACEME"</span><span class="p">;</span>
+    <span class="n">v</span> <span class="o">=</span> <span class="mi">1</span><span class="p">;</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="s">"&lt;html&gt;&lt;body&gt;REPLACEME&lt;/body&gt;&lt;/html&gt;"</span><span class="p">;</span>
+<span class="p">}</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Công cụ Frida sẽ chỉnh sửa lại tin nhắn trước khi nó được đánh số, mã hóa và gửi đến server của Apple:</p>
+
+<div class="language-objc highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><!-- <td class="rouge-gutter gl"><pre class="lineno">1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+</pre></td> --><td class="rouge-code"><pre><span class="p">{</span>
+    <span class="n">gid</span> <span class="o">=</span> <span class="s">"008412B9-A4F7-4B96-96C3-70C4276CB2BE"</span><span class="p">;</span>
+    <span class="n">gv</span> <span class="o">=</span> <span class="mi">8</span><span class="p">;</span>
+    <span class="n">p</span> <span class="o">=</span>     <span class="p">(</span>
+        <span class="s">"mailto:sender@foo.bar"</span><span class="p">,</span>
+        <span class="s">"mailto:receiver@foo.bar”</span><span class="err">
+</span><span class="s">    );</span><span class="err">
+</span><span class="s">    pv = 0;</span><span class="err">
+</span><span class="s">    r = "</span><span class="mi">6401430</span><span class="n">E</span><span class="o">-</span><span class="n">CDD3</span><span class="o">-</span><span class="mi">4</span><span class="n">BC7</span><span class="o">-</span><span class="n">A377</span><span class="o">-</span><span class="mi">7611706</span><span class="n">B431F</span><span class="s">";</span><span class="err">
+</span><span class="s">    t = "</span><span class="n">REPLACEME</span><span class="s">";</span><span class="err">
+</span><span class="s">    v = 1;	</span><span class="err">
+</span><span class="s">    x = "</span><span class="o">&lt;</span><span class="n">html</span><span class="o">&gt;&lt;</span><span class="n">body</span><span class="o">&gt;</span><span class="n">REPLACEME</span><span class="o">&lt;/</span><span class="n">body</span><span class="o">&gt;&lt;/</span><span class="n">html</span><span class="o">&gt;</span><span class="s">";</span><span class="err">
+</span><span class="s">    ati = &lt;content of /private/var/tmp/com.apple.messages/payload&gt;;</span><span class="err">
+</span><span class="s">}</span><span class="err">
+</span></pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Sau khi gửi, đoạn tin nhắn trên sẽ khiến cho tiến trình <strong>imagent</strong> của người nhận deocde dữ liệu trong <em>ati</em> bằng cách sử dụng NSKeyedUnarchiver API.</p>
+
+<p>Tiếp theo, chúng ta sẽ sử dụng CVE-2019–8641 để tiến hành khai thác. Để hiểu rõ hơn về bug này, ta cần phải xem format serial của NSKeyedUnarchiver. Dưới đây là một archive đơn giản chứa serial NSSharedKeyDictionary (NSKeyedUnarchiver đã encode đối tượng trong graph thành <em>plist</em>):</p>
+
+<div class="language-javascript highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><!-- <td class="rouge-gutter gl"><pre class="lineno">1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+32
+33
+34
+35
+36
+37
+38
+39
+40
+41
+42
+43
+44
+45
+46
+47
+48
+49
+50
+51
+52
+53
+54
+55
+56
+57
+58
+59
+60
+61
+62
+63
+64
+65
+66
+67
+68
+69
+</pre></td> --><td class="rouge-code"><pre><span class="p">{</span>
+  <span class="dl">"</span><span class="s2">$archiver</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="dl">"</span><span class="s2">NSKeyedArchiver</span><span class="dl">"</span>
+  <span class="err">#</span> <span class="nx">The</span> <span class="nx">objects</span> <span class="nx">contained</span> <span class="k">in</span> <span class="nx">the</span> <span class="nx">archive</span> <span class="nx">are</span> <span class="nx">stored</span> <span class="k">in</span> <span class="k">this</span> <span class="nx">array</span>
+  <span class="err">#</span> <span class="nx">and</span> <span class="nx">can</span> <span class="nx">be</span> <span class="nx">referenced</span> <span class="nx">during</span> <span class="nx">decoding</span> <span class="nx">using</span> <span class="nx">their</span> <span class="nx">index</span>
+  <span class="dl">"</span><span class="s2">$objects</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="p">[</span>
+    <span class="err">#</span> <span class="nx">Index</span> <span class="mi">0</span> <span class="nx">always</span> <span class="nx">contains</span> <span class="nx">the</span> <span class="nx">nil</span> <span class="nx">value</span>
+    <span class="mi">0</span> <span class="o">=&gt;</span> <span class="dl">"</span><span class="s2">$null</span><span class="dl">"</span>
+    <span class="err">#</span> <span class="nx">The</span> <span class="nx">serialized</span> <span class="nx">NSSharedKeyDictionary</span>
+    <span class="mi">1</span> <span class="o">=&gt;</span> <span class="p">{</span>
+      <span class="dl">"</span><span class="s2">$class</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="o">&lt;</span><span class="nx">CFKeyedArchiverUID</span><span class="o">&gt;</span><span class="p">{</span><span class="nx">value</span> <span class="o">=</span> <span class="mi">7</span><span class="p">}</span>
+      <span class="dl">"</span><span class="s2">NS.count</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="mi">0</span>
+      <span class="dl">"</span><span class="s2">NS.sideDic</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="o">&lt;</span><span class="nx">CFKeyedArchiverUID</span><span class="o">&gt;</span><span class="p">{</span><span class="nx">value</span> <span class="o">=</span> <span class="mi">0</span><span class="p">}</span>
+      <span class="dl">"</span><span class="s2">NS.skkeyset</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="o">&lt;</span><span class="nx">CFKeyedArchiverUID</span><span class="o">&gt;</span><span class="p">{</span><span class="nx">value</span> <span class="o">=</span> <span class="mi">2</span><span class="p">}</span>
+    <span class="p">}</span>
+    <span class="err">#</span> <span class="nx">The</span> <span class="nx">NSSharedKeySet</span> <span class="nx">associated</span> <span class="kd">with</span> <span class="nx">the</span> <span class="nx">dictionary</span>    
+    <span class="mi">2</span> <span class="o">=&gt;</span> <span class="p">{</span>
+      <span class="dl">"</span><span class="s2">$class</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="o">&lt;</span><span class="nx">CFKeyedArchiverUID</span><span class="o">&gt;</span><span class="p">{</span><span class="nx">value</span> <span class="o">=</span> <span class="mi">6</span><span class="p">}</span>
+      <span class="dl">"</span><span class="s2">NS.algorithmType</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="mi">1</span>
+      <span class="dl">"</span><span class="s2">NS.factor</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="mi">3</span>
+      <span class="dl">"</span><span class="s2">NS.g</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="o">&lt;</span><span class="mi">00</span><span class="o">&gt;</span>
+      <span class="dl">"</span><span class="s2">NS.keys</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="o">&lt;</span><span class="nx">CFKeyedArchiverUID</span><span class="o">&gt;</span><span class="p">{</span><span class="nx">value</span> <span class="o">=</span> <span class="mi">3</span><span class="p">}</span>
+      <span class="dl">"</span><span class="s2">NS.M</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="mi">6</span>
+      <span class="dl">"</span><span class="s2">NS.numKey</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="mi">1</span>
+      <span class="dl">"</span><span class="s2">NS.rankTable</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="o">&lt;</span><span class="mi">00000000</span> <span class="mi">0001</span><span class="o">&gt;</span>
+      <span class="dl">"</span><span class="s2">NS.seed0</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="mi">361949685</span>
+      <span class="dl">"</span><span class="s2">NS.seed1</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="mi">2328087422</span>
+      <span class="dl">"</span><span class="s2">NS.select</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="mi">0</span>
+      <span class="dl">"</span><span class="s2">NS.subskset</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="o">&lt;</span><span class="nx">CFKeyedArchiverUID</span><span class="o">&gt;</span><span class="p">{</span><span class="nx">value</span> <span class="o">=</span> <span class="mi">0</span><span class="p">}</span>
+    <span class="p">}</span>
+    <span class="err">#</span> <span class="nx">The</span> <span class="nx">keys</span> <span class="k">of</span> <span class="nx">the</span> <span class="nx">NSSharedKeySet</span> 
+    <span class="mi">3</span> <span class="o">=&gt;</span> <span class="p">{</span>
+      <span class="dl">"</span><span class="s2">$class</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="o">&lt;</span><span class="nx">CFKeyedArchiverUID</span><span class="o">&gt;</span><span class="p">{</span><span class="nx">value</span> <span class="o">=</span> <span class="mi">5</span><span class="p">}</span>
+      <span class="dl">"</span><span class="s2">NS.objects</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="p">[</span>
+        <span class="mi">0</span> <span class="o">=&gt;</span> <span class="o">&lt;</span><span class="nx">CFKeyedArchiverUID</span><span class="o">&gt;</span><span class="p">{</span><span class="nx">value</span> <span class="o">=</span> <span class="mi">4</span><span class="p">}</span>
+      <span class="p">]</span>
+    <span class="p">}</span>
+    <span class="err">#</span> <span class="nx">The</span> <span class="nx">value</span> <span class="k">of</span> <span class="nx">the</span> <span class="nx">first</span> <span class="p">(</span><span class="nx">and</span> <span class="nx">only</span><span class="p">)</span> <span class="nx">key</span>
+    <span class="mi">4</span> <span class="o">=&gt;</span> <span class="dl">"</span><span class="s2">the_key</span><span class="dl">"</span>
+    <span class="err">#</span> <span class="nx">ObjC</span> <span class="nx">classes</span> <span class="nx">are</span> <span class="nx">stored</span> <span class="k">in</span> <span class="k">this</span> <span class="nx">format</span>
+    <span class="mi">5</span> <span class="o">=&gt;</span> <span class="p">{</span>
+      <span class="dl">"</span><span class="s2">$classes</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="p">[</span>
+        <span class="mi">0</span> <span class="o">=&gt;</span> <span class="dl">"</span><span class="s2">NSArray</span><span class="dl">"</span>
+        <span class="mi">1</span> <span class="o">=&gt;</span> <span class="dl">"</span><span class="s2">NSObject</span><span class="dl">"</span>
+      <span class="p">]</span>
+      <span class="dl">"</span><span class="s2">$classname</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="dl">"</span><span class="s2">NSArray</span><span class="dl">"</span>
+    <span class="p">}</span>
+    <span class="mi">6</span> <span class="o">=&gt;</span> <span class="p">{</span>
+      <span class="dl">"</span><span class="s2">$classes</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="p">[</span>
+        <span class="mi">0</span> <span class="o">=&gt;</span> <span class="dl">"</span><span class="s2">NSSharedKeySet</span><span class="dl">"</span>
+        <span class="mi">1</span> <span class="o">=&gt;</span> <span class="dl">"</span><span class="s2">NSObject</span><span class="dl">"</span>
+      <span class="p">]</span>
+      <span class="dl">"</span><span class="s2">$classname</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="dl">"</span><span class="s2">NSSharedKeySet</span><span class="dl">"</span>
+    <span class="p">}</span>
+    <span class="mi">7</span> <span class="o">=&gt;</span> <span class="p">{</span>
+      <span class="dl">"</span><span class="s2">$classes</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="p">[</span>
+        <span class="mi">0</span> <span class="o">=&gt;</span> <span class="dl">"</span><span class="s2">NSSharedKeyDictionary</span><span class="dl">"</span>
+        <span class="mi">1</span> <span class="o">=&gt;</span> <span class="dl">"</span><span class="s2">NSMutableDictionary</span><span class="dl">"</span>
+        <span class="mi">2</span> <span class="o">=&gt;</span> <span class="dl">"</span><span class="s2">NSDictionary</span><span class="dl">"</span>
+        <span class="mi">3</span> <span class="o">=&gt;</span> <span class="dl">"</span><span class="s2">NSObject</span><span class="dl">"</span>
+      <span class="p">]</span>
+      <span class="dl">"</span><span class="s2">$classname</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="dl">"</span><span class="s2">NSSharedKeyDictionary</span><span class="dl">"</span>
+    <span class="p">}</span>
+  <span class="p">]</span>
+  <span class="err">#</span> <span class="nx">A</span> <span class="nx">reference</span> <span class="nx">to</span> <span class="nx">the</span> <span class="nx">root</span> <span class="nx">object</span> <span class="k">in</span> <span class="nx">the</span> <span class="nx">archive</span>
+  <span class="dl">"</span><span class="s2">$top</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="p">{</span>
+    <span class="dl">"</span><span class="s2">root</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="o">&lt;</span><span class="nx">CFKeyedArchiverUID</span><span class="o">&gt;</span><span class="p">{</span><span class="nx">value</span> <span class="o">=</span> <span class="mi">1</span><span class="p">}</span>
+  <span class="p">}</span>
+  <span class="dl">"</span><span class="s2">$version</span><span class="dl">"</span> <span class="o">=&gt;</span> <span class="mi">100000</span>
+<span class="p">}</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Điều đáng chú ý ở đây là kiểu format này hỗ trợ tham chiếu đến các object bên trong list bằng các UID từ CFKeyedArchiverUID.</p>
+
+<p>Trong khi đang unarchive, NSKeyedUnarchiver sẽ liên tục map lại các UID cho những object đó. Hơn nữa, việc tham chiếu được NSKeyedUnarchiver map lại trước khi phương thức initWithCoder được thực thi. Vì vậy nên ta có thể decode lần lượt các đối tượng đang được unarchive ngay trong callstack.</p>
+
+<p>Từ đó ta biết được rằng object đầu tiên có thể <em>chưa được khởi tạo hoàn toàn</em> khi nó được tham chiếu dẫn đến sự tồn tại lỗ hổng CVE-2019-8641.</p>
+
+<p>Pseudo-code (Object-C) của initWithCoder trong hai class NSSharedKeyDictionary và NSSharedKeySet như sau:</p>
+
+<pre><code class="language-pseudocode">[obj doXWith:y and:z];
+obj-&gt;doX(y,z);
+</code></pre>
+
+<p>Nếu bạn không biết Object-C, có thể tham khảo bằng C++:</p>
+
+<div class="language-c++ highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><!-- <td class="rouge-gutter gl"><pre class="lineno">1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+30
+31
+</pre></td> --><td class="rouge-code"><pre><span class="o">-</span><span class="p">[</span><span class="n">NSSharedKeyDictionary</span> <span class="n">initWithCoder</span><span class="o">:</span><span class="n">coder</span><span class="p">]</span> <span class="p">{</span>
+  <span class="n">self</span><span class="o">-&gt;</span><span class="n">_keyMap</span> <span class="o">=</span> <span class="p">[</span><span class="n">coder</span> <span class="n">decodeObjectOfClass</span><span class="o">:</span><span class="p">[</span><span class="n">NSSharedKeySet</span> <span class="k">class</span><span class="p">]</span>
+                         <span class="nl">forKey:</span><span class="s">"NS.skkeyset"</span><span class="p">];</span>
+  <span class="c1">// ... decode values etc.</span>
+<span class="p">}</span>
+
+<span class="o">-</span><span class="p">[</span><span class="n">NSSharedKeySet</span> <span class="n">initWithCoder</span><span class="o">:</span><span class="n">coder</span><span class="p">]</span> <span class="p">{</span>
+  <span class="n">self</span><span class="o">-&gt;</span><span class="n">_numKey</span> <span class="o">=</span> <span class="p">[</span><span class="n">coder</span> <span class="n">decodeInt64ForKey</span><span class="o">:</span><span class="err">@</span><span class="s">"NS.numKey"</span><span class="p">];</span>
+  <span class="n">self</span><span class="o">-&gt;</span><span class="n">_rankTable</span> <span class="o">=</span> <span class="p">[</span><span class="n">coder</span> <span class="n">decodeBytesForKey</span><span class="o">:</span><span class="err">@</span><span class="s">"NS.rankTable"</span><span class="p">];</span>
+  <span class="c1">// ... copy more fields from the archive</span>
+  <span class="n">self</span><span class="o">-&gt;</span><span class="n">_subSharedKeySet</span> <span class="o">=</span> <span class="p">[</span><span class="n">coder</span> 
+                            <span class="nl">decodeObjectOfClass:</span><span class="p">[</span><span class="n">NSSharedKeySet</span> <span class="k">class</span><span class="p">]</span>
+                            <span class="nl">forKey:</span><span class="err">@</span><span class="s">"NS.subskset"</span><span class="p">]];</span>
+
+  <span class="n">NSArray</span><span class="o">*</span> <span class="n">keys</span> <span class="o">=</span> <span class="p">[</span><span class="n">coder</span> <span class="n">decodeObjectOfClasses</span><span class="o">:</span><span class="p">[...]</span> 
+                         <span class="nl">forKey:</span><span class="err">@</span><span class="s">"NS.keys"</span><span class="p">]];</span>
+  <span class="k">if</span> <span class="p">(</span><span class="n">self</span><span class="o">-&gt;</span><span class="n">_numKey</span> <span class="o">!=</span> <span class="p">[</span><span class="n">keys</span> <span class="n">count</span><span class="p">])</span> <span class="p">{</span>
+    <span class="k">return</span> <span class="n">fail</span><span class="p">(</span><span class="err">“</span><span class="n">Inconsistent</span> <span class="n">archive</span><span class="p">);</span>
+  <span class="p">}</span>
+  <span class="n">self</span><span class="o">-&gt;</span><span class="n">_keys</span> <span class="o">=</span> <span class="n">calloc</span><span class="p">(</span><span class="n">self</span><span class="o">-&gt;</span><span class="n">_numKey</span><span class="p">,</span> <span class="mi">8</span><span class="p">);</span>
+  <span class="c1">// copy keys into _keys</span>
+
+  <span class="c1">// Verify that all keys can be looked up</span>
+  <span class="k">for</span> <span class="p">(</span><span class="n">id</span> <span class="n">key</span> <span class="n">in</span> <span class="n">keys</span><span class="p">)</span> <span class="p">{</span>
+    <span class="k">if</span> <span class="p">([</span><span class="n">self</span> <span class="n">indexForKey</span><span class="o">:</span><span class="n">key</span><span class="p">]</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="p">{</span>
+      <span class="n">NSMutableArray</span><span class="o">*</span> <span class="n">allKeys</span> <span class="o">=</span> <span class="p">[</span><span class="n">NSMutableArray</span> <span class="n">arrayWithArray</span><span class="o">:</span><span class="n">keys</span><span class="p">];</span>
+      <span class="p">[</span><span class="n">allKeys</span> <span class="n">addObjectsFromArray</span><span class="o">:</span><span class="p">[</span><span class="n">self</span><span class="o">-&gt;</span><span class="n">_subSharedKeySet</span> <span class="n">allKeys</span><span class="p">]];</span>
+      <span class="k">return</span> <span class="p">[</span><span class="n">NSSharedKeySet</span> <span class="n">keySetWithKeys</span><span class="o">:</span><span class="n">allKeys</span><span class="p">];</span>
+    <span class="p">}</span>
+  <span class="p">}</span>
+<span class="p">}</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Ở dòng 20, <em>indexForKey</em> trong vòng lặp for đã sử dụng hash của một key để index vào <em>_rankTable</em> và sử dụng kết quả như một index vào <em>_keys</em>. Nó tìm tất cả các key trong subSharedKeySet cho đến khi tìm ra key đúng:</p>
+
+<div class="language-c++ highlighter-rouge"><div class="highlight"><pre class="highlight"><code><table class="rouge-table"><tbody><tr><!-- <td class="rouge-gutter gl"><pre class="lineno">1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+</pre></td> --><td class="rouge-code"><pre><span class="o">-</span><span class="p">[</span><span class="n">NSSharedKeySet</span> <span class="n">indexForKey</span><span class="o">:</span><span class="p">]</span> <span class="p">{</span>
+  <span class="n">NSSharedKeySet</span><span class="o">*</span> <span class="n">current</span> <span class="o">=</span> <span class="n">self</span><span class="p">;</span>
+  <span class="kt">uint32_t</span> <span class="n">prevLength</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+  <span class="k">while</span> <span class="p">(</span><span class="n">current</span><span class="p">)</span> <span class="p">{</span>
+    <span class="c1">// Compute a hash from the key and other internal values of    </span>
+    <span class="c1">// the KeySet. Convert the hash to an index and ensure that it </span>
+    <span class="c1">// is within the bounds of rankTable</span>
+    <span class="kt">uint32_t</span> <span class="n">rankTableIndex</span> <span class="o">=</span> <span class="p">...;</span>
+    <span class="kt">uint32_t</span> <span class="n">index</span> <span class="o">=</span> <span class="n">self</span><span class="o">-&gt;</span><span class="n">_rankTable</span><span class="p">[</span><span class="n">rankTableIndex</span><span class="p">];</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">index</span> <span class="o">&lt;</span> <span class="n">self</span><span class="o">-&gt;</span><span class="n">_numKey</span><span class="p">)</span> <span class="p">{</span>
+      <span class="n">id</span> <span class="n">candidate</span> <span class="o">=</span> <span class="n">self</span><span class="o">-&gt;</span><span class="n">_keys</span><span class="p">[</span><span class="n">index</span><span class="p">];</span>
+      <span class="k">if</span> <span class="p">(</span><span class="n">candidate</span> <span class="o">!=</span> <span class="n">nil</span><span class="p">)</span> <span class="p">{</span>
+        <span class="k">if</span> <span class="p">([</span><span class="n">key</span> <span class="n">isEqual</span><span class="o">:</span><span class="n">candidate</span><span class="p">])</span> <span class="p">{</span>
+          <span class="k">return</span> <span class="n">prevLength</span> <span class="o">+</span> <span class="n">index</span><span class="p">;</span>
+        <span class="p">}</span>
+      <span class="p">}</span>
+    <span class="n">prevLength</span> <span class="o">+=</span> <span class="n">self</span><span class="o">-&gt;</span><span class="n">_numKey</span><span class="p">;</span>
+    <span class="n">current</span> <span class="o">=</span> <span class="n">self</span><span class="o">-&gt;</span><span class="n">_subSharedKeySet</span><span class="p">;</span>
+  <span class="p">}</span>
+  <span class="k">return</span> <span class="o">-</span><span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+</pre></td></tr></tbody></table></code></pre></div></div>
+
+<p>Với mớ logic trên, object graph sau đây sẽ chỉ rõ hơn về lỗi tràn bộ nhớ:</p>
+
+<p><img src="https://miro.medium.com/max/800/0*sCqKzBg2rcN6FJIp.png" alt="Image for post" style="zoom:80%;" /></p>
+
+<p>Đây là những gì xảy ra trong quá trình unarchive:</p>
+
+<ol>
+  <li>Sau khi NSSharedKeyDictionary được unarchive, nó sẽ tự unarchive SharedKeySet của nó.</li>
+  <li>Phương thức <code class="language-plaintext highlighter-rouge">initWithCoder</code> của ShareKeySet1 được gọi khi subSharedKeySet của keyset này được unarchive. Tại thời điểm này:
++ <code class="language-plaintext highlighter-rouge">_numKeys</code> hoàn toàn nằm trong tầm kiểm soát của người tấn công mà không có sự kiểm tra nào (kiểm tra chỉ xảy ra sau khi <em>_keys</em> đã được unarchive)
++ <code class="language-plaintext highlighter-rouge">_rankTable</code> cũng được kiểm soát
++ <code class="language-plaintext highlighter-rouge">_keys</code> vẫn là một mảng rỗng (nullptr)</li>
+  <li>SharedKeySet2 đã được unarchive xong. subSharedKeySet của nó hiện tại đang tham chiếu đến SharedKeySet1 (keyset này vẫn chưa unarchive xong). Cuối cùng, nó sẽ gọi indexForKey cho mọi key trong mảng _keys (dòng 20)</li>
+  <li>rankTable của SharedKeySet2 đều có giá trị ‘0’ nên chỉ có key đầu tiên mới có thể tự map chính nó (xem dòng 8 đến 15 trong indexForKey). Từ key thứ 2 nó sẽ tham chiếu đến SharedKeySet1. Tại đây, vì _numKey và _rankTable đã được kiểm soát sẽ dẫn đến việc code bị crash.</li>
+</ol>
+
+<p>Callstack tại thời điểm crash như sau:</p>
+
+<p>Đây là những gì xảy ra trong quá trình unarchive:</p>
+
+<ol>
+  <li>Sau khi NSSharedKeyDictionary được unarchive, nó sẽ tự unarchive SharedKeySet của nó.</li>
+  <li>Phương thức <code class="language-plaintext highlighter-rouge">initWithCoder</code> của ShareKeySet1 được gọi khi subSharedKeySet của keyset này được unarchive. Tại thời điểm này:
++ <code class="language-plaintext highlighter-rouge">_numKeys</code> hoàn toàn nằm trong tầm kiểm soát của người tấn công mà không có sự kiểm tra nào (kiểm tra chỉ xảy ra sau khi <em>_keys</em> đã được unarchive)
++ <code class="language-plaintext highlighter-rouge">_rankTable</code> cũng được kiểm soát
++ <code class="language-plaintext highlighter-rouge">_keys</code> vẫn là một mảng rỗng (nullptr)</li>
+  <li>SharedKeySet2 đã được unarchive xong. subSharedKeySet của nó hiện tại đang tham chiếu đến SharedKeySet1 (keyset này vẫn chưa unarchive xong). Cuối cùng, nó sẽ gọi indexForKey cho mọi key trong mảng _keys (dòng 20)</li>
+  <li>rankTable của SharedKeySet2 đều có giá trị ‘0’ nên chỉ có key đầu tiên mới có thể tự map chính nó (xem dòng 8 đến 15 trong indexForKey). Từ key thứ 2 nó sẽ tham chiếu đến SharedKeySet1. Tại đây, vì _numKey và _rankTable đã được kiểm soát sẽ dẫn đến việc code bị crash.</li>
+</ol>
+
+<p>Callstack tại thời điểm crash như sau:</p>
+
+<p><img src="https://miro.medium.com/max/800/0*z2e8N5jKrWFq8a3z.png" alt="Image for post" style="zoom:80%;" /></p>
+
+<p>Do đó, một địa chỉ bất kì (trong trường hợp này là 0x41414140) sẽ được tham chiếu đến và được sử dụng như một con trỏ object (“id”). Đây chính là địa chỉ truy cập đến bug nhưng phải thỏa hai điều kiện:</p>
+
+<ol>
+  <li>Địa chỉ phải chia hết cho 8 (vì mảng <code class="language-plaintext highlighter-rouge">_keys </code>chứa giá trị kiểu con trỏ)</li>
+  <li>Địa chỉ phải ít hơn 32G vì index là một unsigned integer (4-byte)</li>
+</ol>
+
+<p>May mắn là trên iOS, hầu hết (?) những thứ “đặc biệt” thường nằm dưới 0x800000000 (32G) nên ta có thể truy cập thoải mái.</p>
+
+<p>Tóm lại, bài viết này cho ta thấy rằng một con trỏ rỗng (null pointer) lại trở thành một công cụ exploit nguy hiểm (ít nhất là trong trường hợp này).</p>
+
+<p>Tuy nhiên tại thời điểm này, vẫn chưa có thông tin gì về địa chỉ của các tiến trình bên thiết bị của nạn nhân cả. Ta sẽ bàn về vấn đề này trong bài viết tiếp theo.</p>
+:ET
